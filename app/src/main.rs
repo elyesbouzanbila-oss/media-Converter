@@ -5,6 +5,13 @@
 //! the protocol. To review UI behaviour without a PDFium dependency, swap the
 //! one engine call below for `engine::demo::spawn_demo_engine()`.
 
+// A windows-subsystem binary opens no console window of its own. Release
+// builds only: a debug build keeps the console subsystem so tracing and
+// panics stay visible under `cargo run`. The worker children spoken to over
+// pipes (engine::WORKER_FLAG) do not need one either — they print nothing to
+// a console by design.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod engine;
 mod log_ring;
