@@ -8,7 +8,7 @@
 //! `show` takes the parent `Ui` (which eframe hands the app directly).
 
 use crate::app::{App, BottomTab};
-use crate::state::{Job, JobStatus, OutputMode, OverwritePolicy, TargetFormat};
+use crate::state::{Job, JobStatus, OutputMode, OverwritePolicy};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::time::Duration;
@@ -113,10 +113,9 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
                         .push_timed(format!("cleared {cleared} finished job(s)"));
                 }
 
-                let cancellable = (counts.queued > 0
-                    || counts.running > 0
-                    || app.engine_in_flight() > 0)
-                    && app.engine_alive();
+                let cancellable =
+                    (counts.queued > 0 || counts.running > 0 || app.engine_in_flight() > 0)
+                        && app.engine_alive();
                 if ui
                     .add_enabled(cancellable, egui::Button::new("Cancel all"))
                     .clicked()
@@ -167,8 +166,8 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             egui::ComboBox::from_id_salt("target_format")
                 .selected_text(app.settings.target.label())
                 .show_ui(ui, |ui| {
-                    for f in TargetFormat::ALL {
-                        ui.selectable_value(&mut app.settings.target, f, f.label());
+                    for f in crate::engine::supported_targets() {
+                        ui.selectable_value(&mut app.settings.target, *f, f.label());
                     }
                 });
             ui.add_space(8.0);
@@ -198,11 +197,7 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                     .as_ref()
                     .map(|p| path_display(p, 34))
                     .unwrap_or_else(|| "(not set)".to_owned());
-                if ui
-                    .button("Browse…")
-                    .on_hover_text(&dir_text)
-                    .clicked()
-                {
+                if ui.button("Browse…").on_hover_text(&dir_text).clicked() {
                     app.pick_output_folder();
                 }
                 ui.weak(dir_text);
@@ -242,7 +237,10 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                 {
                     app.settings.workers = crate::state::default_worker_count() as u32;
                 }
-                ui.weak(format!("suggested: {}", crate::state::default_worker_count()));
+                ui.weak(format!(
+                    "suggested: {}",
+                    crate::state::default_worker_count()
+                ));
             });
             ui.add_space(8.0);
 
@@ -319,12 +317,24 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
                 .column(Column::exact(46.0))
                 .column(Column::exact(32.0))
                 .header(24.0, |mut header| {
-                    header.col(|ui| { ui.label("State"); });
-                    header.col(|ui| { ui.label("File"); });
-                    header.col(|ui| { ui.label("Format"); });
-                    header.col(|ui| { ui.label("Progress"); });
-                    header.col(|ui| { ui.label("Time"); });
-                    header.col(|ui| { ui.label("Warn"); });
+                    header.col(|ui| {
+                        ui.label("State");
+                    });
+                    header.col(|ui| {
+                        ui.label("File");
+                    });
+                    header.col(|ui| {
+                        ui.label("Format");
+                    });
+                    header.col(|ui| {
+                        ui.label("Progress");
+                    });
+                    header.col(|ui| {
+                        ui.label("Time");
+                    });
+                    header.col(|ui| {
+                        ui.label("Warn");
+                    });
                     header.col(|_ui| {});
                 })
                 .body(|mut body| {
@@ -340,10 +350,7 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
 
                             row.col(|ui| {
                                 if ui
-                                    .selectable_label(
-                                        selected == Some(job.id),
-                                        job.source_name(),
-                                    )
+                                    .selectable_label(selected == Some(job.id), job.source_name())
                                     .clicked()
                                 {
                                     action = Some(RowAction::Select(job.id));
@@ -462,9 +469,9 @@ pub fn draw_central(app: &mut App, ui: &mut egui::Ui) {
     let accent = egui::Color32::from_rgb(0x4f, 0x8a, 0xff);
     let mut frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 10));
     if hovering {
-        frame = frame
-            .stroke(egui::Stroke::new(2.5, accent))
-            .fill(egui::Color32::from_rgba_unmultiplied(0x4f, 0x8a, 0xff, 0x14));
+        frame = frame.stroke(egui::Stroke::new(2.5, accent)).fill(
+            egui::Color32::from_rgba_unmultiplied(0x4f, 0x8a, 0xff, 0x14),
+        );
     }
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         let counts = app.counts();
@@ -581,7 +588,9 @@ fn draw_log(app: &App, ui: &mut egui::Ui) {
         (guard.dropped(), guard.tail(600))
     };
     if dropped > 0 {
-        ui.weak(format!("… {dropped} older line(s) dropped by the ring buffer"));
+        ui.weak(format!(
+            "… {dropped} older line(s) dropped by the ring buffer"
+        ));
     }
     for line in lines {
         let color = if line.contains("FAILED") {

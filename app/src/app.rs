@@ -11,7 +11,7 @@
 
 use crate::engine::{EngineChannels, EngineCommand, EngineEvent, JobSpec};
 use crate::log_ring::LogHandle;
-use crate::state::{resolve_output_path, Counts, JobId, JobStatus, Queue, Settings};
+use crate::state::{Counts, JobId, JobStatus, Queue, Settings, resolve_output_path};
 use eframe::egui;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -52,15 +52,20 @@ pub enum BottomTab {
 }
 
 impl App {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        log: LogHandle,
-        engine: EngineChannels,
-    ) -> Self {
-        let settings: Settings = cc
+    pub fn new(cc: &eframe::CreationContext<'_>, log: LogHandle, engine: EngineChannels) -> Self {
+        let mut settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value::<Settings>(s, SETTINGS_KEY))
             .unwrap_or_default();
+
+        // A persisted target the engine does not offer any more (or one
+        // persisted by a build that offered more) is repaired to the first
+        // supported one rather than silently failing at convert time.
+        if !crate::engine::supported_targets().contains(&settings.target) {
+            if let Some(first) = crate::engine::supported_targets().first() {
+                settings.target = *first;
+            }
+        }
 
         if settings.dark_theme {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
@@ -69,7 +74,7 @@ impl App {
         }
 
         log.lock().push_timed(format!(
-            "engine started: demo pool (workers default {}), UI shell M0",
+            "engine started: worker-process pool, default {} worker(s)",
             settings.workers_or_default()
         ));
 
@@ -139,21 +144,19 @@ impl App {
                         output,
                     });
                 }
-                None => {
-                    unresolved.push(Unresolved {
-                        id: job.id,
-                        message: "no output folder set".to_string(),
-                    })
-                }
+                None => unresolved.push(Unresolved {
+                    id: job.id,
+                    message: "no output folder set".to_string(),
+                }),
             }
         }
 
         for u in unresolved {
             if let Some(job) = self.queue.job_mut(u.id) {
                 job.status = JobStatus::Failed;
-                job.detail =
-                    Some("The output folder could not be determined. Set one in settings."
-                        .to_string());
+                job.detail = Some(
+                    "The output folder could not be determined. Set one in settings.".to_string(),
+                );
             }
             self.log
                 .lock()
@@ -165,16 +168,15 @@ impl App {
         }
         let workers = settings.workers_or_default();
         let n = specs.len();
-        match self
-            .engine
-            .commands
-            .send(EngineCommand::Start { jobs: specs, workers })
-        {
+        match self.engine.commands.send(EngineCommand::Start {
+            jobs: specs,
+            workers,
+        }) {
             Ok(()) => {
                 self.in_flight += n;
-                self.log.lock().push_timed(format!(
-                    "started batch of {n} job(s), {workers} worker(s)"
-                ));
+                self.log
+                    .lock()
+                    .push_timed(format!("started batch of {n} job(s), {workers} worker(s)"));
             }
             Err(err) => {
                 // The channel died under us: fail the batch rather than leave
@@ -242,9 +244,7 @@ impl App {
                     job.warnings.push(text.clone());
                 }
                 self.warnings.push(format!("{name}: {text}"));
-                self.log
-                    .lock()
-                    .push_timed(format!("WARN {name}: {text}"));
+                self.log.lock().push_timed(format!("WARN {name}: {text}"));
             }
             EngineEvent::Finished {
                 id,
@@ -343,8 +343,13 @@ impl App {
     // -------------------------------------------------------------------------
 
     pub fn add_files_from_dialog(&mut self) {
+        // The dialog filters first, so the user sees the file picker do the
+        // honest thing; anything that still gets through an "All files" pass
+        // is filtered by `add_files` with a log line.
         let picked = rfd::FileDialog::new()
             .set_title("Add documents to convert")
+            .add_filter("Documents (PDF)", &["pdf"])
+            .add_filter("All files", &["*"])
             .pick_files();
         if let Some(files) = picked {
             self.add_files(files);
@@ -366,9 +371,32 @@ impl App {
         if files.is_empty() {
             return;
         }
+        // The queue only accepts what the engine can read: offering more
+        // would mean a failed job per file, which is noise instead of
+        // guidance. The capability list comes from the adapter, so when the
+        // facade learns a new format the queue accepts it with no UI change.
+        let total = files.len();
+        files.retain(|path| crate::engine::readable(path));
+        if files.is_empty() {
+            self.log.lock().push_timed(format!(
+                "nothing added: skipped {total} file(s) the engine cannot read (PDF only for now)"
+            ));
+            return;
+        }
+
         let target = self.settings.target;
         let ids = self.queue.add(files.iter().cloned(), target);
-        self.log.lock().push_timed(format!("added {} file(s)", ids.len()));
+        if ids.len() < total {
+            self.log.lock().push_timed(format!(
+                "added {} file(s), skipped {} the engine cannot read (PDF only for now)",
+                ids.len(),
+                total - ids.len()
+            ));
+        } else {
+            self.log
+                .lock()
+                .push_timed(format!("added {} file(s)", ids.len()));
+        }
     }
 
     pub fn pick_output_folder(&mut self) {
@@ -437,10 +465,9 @@ impl eframe::App for App {
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
     }
 
-    /// Tell the engine to stop worker threads before the process goes away.
-    /// The demo pool joins its workers cleanly (protocol requirement 2 keeps
-    /// notifications honest even now); the real facade will value the same
-    /// handshake.
+    /// Tell the engine to stop worker processes before the process goes
+    /// away. Protocol requirement 2 keeps per-job accounting honest even on
+    /// the way out.
     fn on_exit(&mut self) {
         if self.engine_alive() {
             let _ = self.engine.commands.send(EngineCommand::Shutdown);

@@ -1209,10 +1209,12 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 name = "dconv-app"
 version = "0.1.0"
 dependencies = [
+ "dconv-engine",
  "eframe",
  "egui_extras",
  "rfd",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -1248,8 +1250,10 @@ dependencies = [
  "dconv-docx",
  "dconv-ir",
  "dconv-pdf",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "zip",
 ]
 
 [[package]]

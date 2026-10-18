@@ -1,9 +1,9 @@
 //! dconvert — desktop GUI front end for the docconvert engine.
 //!
-//! M0 builds the full shell against a demo engine (`engine::spawn_demo_engine`)
-//! so the interface can be finished and reviewed before the real facade in
-//! `dconv-engine` lands. Swapping the real engine in is a one-line change at
-//! the call below, since both speak the same command/event protocol.
+//! The real engine (`engine::spawn_real_engine`) is a pool of worker
+//! processes around the facade in `dconv-engine`; see `app/src/engine.rs` for
+//! the protocol. To review UI behaviour without a PDFium dependency, swap the
+//! one engine call below for `engine::demo::spawn_demo_engine()`.
 
 mod app;
 mod engine;
@@ -12,6 +12,14 @@ mod state;
 mod ui;
 
 fn main() -> eframe::Result {
+    // Worker process: this executable is re-invoked as a conversion worker by
+    // the engine's process pool. Handle it before the first line of GUI code
+    // so a child does no windowing work at all, and exit the process with the
+    // worker's status (never returns).
+    if std::env::args().any(|arg| arg == engine::WORKER_FLAG) {
+        std::process::exit(engine::worker_main());
+    }
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -26,7 +34,7 @@ fn main() -> eframe::Result {
             // The log ring is created before the engine so tracing output from
             // either side lands in the same ring from the very first frame.
             let log = log_ring::install_tracing();
-            let engine = engine::spawn_demo_engine();
+            let engine = engine::spawn_real_engine();
             Ok(Box::new(app::App::new(cc, log, engine)))
         }),
     )

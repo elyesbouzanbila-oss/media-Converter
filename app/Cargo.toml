@@ -14,10 +14,12 @@ name = "dconvert"
 path = "src/main.rs"
 
 [dependencies]
+dconv-engine = { workspace = true }
 eframe = { workspace = true }
 egui_extras = { workspace = true }
 rfd = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

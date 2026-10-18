@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 /// The output format a job converts to.
 ///
-/// The demo engine only knows these two; M1 will take the real list from the
-/// facade's capability query and stop hard-coding anything here. Enum variants
-/// are kept distinguishable rather than reduced to an extension string so the
-/// UI can present friendly labels.
+/// Which variants are *offered* comes from the engine adapter's capability
+/// list (`engine::supported`, a stand-in for the facade's capability query
+/// until the engine owner lands it) — never from this enum, which only names
+/// shapes the UI can present. Enum variants are kept distinguishable rather
+/// than reduced to an extension string so the UI can present friendly labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetFormat {
     /// Office Open XML word processing document.
@@ -29,8 +30,6 @@ pub enum TargetFormat {
 }
 
 impl TargetFormat {
-    pub const ALL: [TargetFormat; 2] = [TargetFormat::Docx, TargetFormat::PlainText];
-
     /// Extension written on output files, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -308,12 +307,9 @@ impl Queue {
     /// Mutable access to the running and queued jobs, in queue order. Used by
     /// batch start to resolve output paths.
     pub fn pending_mut(&mut self) -> impl Iterator<Item = &mut Job> {
-        self.jobs.iter_mut().filter(|j| {
-            matches!(
-                j.status,
-                JobStatus::Queued | JobStatus::Running
-            )
-        })
+        self.jobs
+            .iter_mut()
+            .filter(|j| matches!(j.status, JobStatus::Queued | JobStatus::Running))
     }
 
     pub fn counts(&self) -> Counts {
@@ -471,8 +467,7 @@ mod tests {
     fn output_name_swaps_extension() {
         let settings = Settings::default();
         let mut taken = HashSet::new();
-        let out = resolve_output_path(&settings, Path::new("C:/u/report.pdf"), &mut taken)
-            .unwrap();
+        let out = resolve_output_path(&settings, Path::new("C:/u/report.pdf"), &mut taken).unwrap();
         assert_eq!(out, PathBuf::from("C:/u/report.docx"));
     }
 
@@ -487,12 +482,7 @@ mod tests {
             ..Settings::default()
         };
         let mut taken = HashSet::new();
-        let out = resolve_output_path(
-            &settings,
-            Path::new("C:/u/report.pdf"),
-            &mut taken,
-        )
-        .unwrap();
+        let out = resolve_output_path(&settings, Path::new("C:/u/report.pdf"), &mut taken).unwrap();
         assert_eq!(out, dir.path().join("report-1.txt"));
     }
 
