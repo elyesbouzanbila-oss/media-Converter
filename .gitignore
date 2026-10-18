@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# Vendored PDFium binaries are downloaded by scripts/fetch-pdfium.ps1
+/third_party/pdfium/bin/
+/third_party/pdfium/lib/
+/third_party/pdfium/include/
+/third_party/pdfium/.cache/
+
+# Local scratch: sample documents for conversion-quality testing.
+/tests/fixtures/private/
+/tmp/

@@ -1,0 +1,12 @@
+[package]
+name = "spike-pdf-extract"
+description = "Phase 0 spike: measure PDFium text-with-geometry extraction speed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+pdfium-render = { workspace = true }
+anyhow = { workspace = true }

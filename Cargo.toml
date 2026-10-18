@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "spikes/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/docconvert"
+
+[workspace.dependencies]
+# --- our crates ---
+ir = { path = "crates/ir" }
+
+# --- serialization / errors ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+
+# --- concurrency ---
+rayon = "1.12"
+crossbeam-channel = "0.5"
+
+# --- logging / diagnostics ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- pdf reading (FFI) ---
+pdfium-render = { version = "0.9.4", features = ["paragraph"] }
+
+# --- pdf writing (pure rust) ---
+# typst = "0.15.1"
+# typst-pdf = "0.15.1"
+
+# --- Release: this workload is pure CPU-bound compute, so LTO pays off. ---
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# --- Spikes and benchmarks: fully optimised codegen, but no whole-program
+#     LTO, so iteration stays fast. `cargo run --profile spike`. ---
+[profile.spike]
+inherits = "release"
+lto = false
+strip = false
+
+# --- Dev: optimise dependencies so heavy crates (typst, pdfium) are usable
+#     in debug builds without a 20x slowdown. Our own crates stay unoptimised
+#     so debug info and incremental rebuilds stay fast. ---
+[profile.dev.package."*"]
+opt-level = 2
