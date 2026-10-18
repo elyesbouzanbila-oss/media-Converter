@@ -1228,6 +1228,8 @@ dependencies = [
  "clap",
  "dconv-engine",
  "dconv-ir",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

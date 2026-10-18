@@ -14,7 +14,14 @@
 //! supported are a curated list, not a matrix.
 
 pub use dconv_ir as ir;
-pub use dconv_pdf::Sink;
+// `PdfError` and `ReadStats` are re-exported rather than left to `dconv-pdf`
+// because a front end must be able to name them without depending on the reader
+// crate: cancellation reaches a front end as `PdfError::Cancelled` through the
+// reader chain, and the diagnostics a conversion reports *are* a `ReadStats`.
+// Without this a front end either matches on error strings or takes the stats
+// apart field by field, and both of those go stale the first time the reader
+// gains a variant. Asked for by the GUI owner; the ask was right.
+pub use dconv_pdf::{PdfError, ReadStats, Sink};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,7 +29,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
-    Reader(#[from] dconv_pdf::PdfError),
+    Reader(#[from] PdfError),
 
     #[error(transparent)]
     Writer(#[from] dconv_docx::DocxError),
@@ -44,6 +51,12 @@ pub enum Format {
 }
 
 impl Format {
+    /// Every format this build can name, for exhaustive checks.
+    ///
+    /// A list rather than a `strum` derive or a macro: with two formats the
+    /// derive would be more machinery than the thing it derives.
+    pub const ALL: &[Format] = &[Format::Pdf, Format::Docx];
+
     pub const fn extension(self) -> &'static str {
         match self {
             Format::Pdf => "pdf",
@@ -51,17 +64,20 @@ impl Format {
         }
     }
 
-    pub fn from_path(path: &Path) -> Option<Self> {
-        match path
-            .extension()?
-            .to_str()?
-            .to_ascii_lowercase()
-            .as_str()
-        {
+    /// The format a bare extension names, case-insensitively and without the
+    /// dot. Separate from [`Format::from_path`] because a front end usually has
+    /// an extension before it has a path: a queue is filtered as files are
+    /// added, and a folder is scanned before anything is opened.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension.trim_start_matches('.').to_ascii_lowercase().as_str() {
             "pdf" => Some(Format::Pdf),
             "docx" => Some(Format::Docx),
             _ => None,
         }
+    }
+
+    pub fn from_path(path: &Path) -> Option<Self> {
+        Self::from_extension(path.extension()?.to_str()?)
     }
 }
 
@@ -72,6 +88,63 @@ impl std::fmt::Display for Format {
             Format::Docx => "DOCX",
         })
     }
+}
+
+/// Every conversion this build can actually perform, as `(reader, writer)`.
+///
+/// The single list behind both [`Converter::convert`] and [`targets_for`], so
+/// that what a front end offers and what the facade does cannot drift apart. A
+/// front end cannot see the dispatch match in `convert`, so without this it has
+/// to copy the match — and a copy is what goes stale. The GUI owner asked for
+/// this query in a comment; the comment was right, and the reason it is right is
+/// that a UI offering a format the engine rejects fails one job per file, fifty
+/// times, after the user has queued them.
+///
+/// A row here is a promise about `convert`, not a wish: `every_promised_pair_has_
+/// a_dispatch_arm` fails if a row has no arm to carry it out.
+pub const CONVERSIONS: &[(Format, Format)] = &[(Format::Pdf, Format::Docx)];
+
+/// The outputs this build can produce from `source`.
+///
+/// Empty means the format is not read at all, which is the question a front end
+/// is really asking when it filters a queue: is this file worth offering?
+pub fn targets_for(source: Format) -> Vec<Format> {
+    CONVERSIONS
+        .iter()
+        .filter(|(from, _)| *from == source)
+        .map(|(_, to)| *to)
+        .collect()
+}
+
+/// The formats this build can read, in the order [`CONVERSIONS`] lists them.
+pub fn readers() -> Vec<Format> {
+    let mut seen = Vec::new();
+    for (from, _) in CONVERSIONS {
+        if !seen.contains(from) {
+            seen.push(*from);
+        }
+    }
+    seen
+}
+
+/// Every output format reachable from anything this build reads — the union a
+/// settings panel offers before a queue has decided what is in it.
+pub fn all_targets() -> Vec<Format> {
+    let mut seen = Vec::new();
+    for (_, to) in CONVERSIONS {
+        if !seen.contains(to) {
+            seen.push(*to);
+        }
+    }
+    seen
+}
+
+/// Whether [`Converter::convert`] accepts this pair.
+///
+/// Checked before the dispatch match rather than left to its catch-all arm, so
+/// that [`CONVERSIONS`] decides *whether* and the match decides only *how*.
+fn supported_pair(from: Format, to: Format) -> bool {
+    CONVERSIONS.contains(&(from, to))
 }
 
 /// What one conversion did.
@@ -88,7 +161,7 @@ pub struct Report {
     /// What the reader found, including anything it had to discard. Carried
     /// whole rather than copied field by field so that a new diagnostic does not
     /// need plumbing through three layers to become visible.
-    pub stats: dconv_pdf::ReadStats,
+    pub stats: ReadStats,
 }
 
 impl Report {
@@ -143,8 +216,18 @@ impl Converter {
             path: output.to_path_buf(),
         })?;
 
+        // The capability table decides whether the pair is supported, so that
+        // `targets_for` and `convert` answer with the same list rather than with
+        // two opinions that have to be kept in step by hand.
+        if !supported_pair(from, to) {
+            return Err(EngineError::UnsupportedPair { from, to });
+        }
+
         match (from, to) {
             (Format::Pdf, Format::Docx) => self.pdf_to_docx(input, output, sink),
+            // Unreachable while `CONVERSIONS` and this match agree — the
+            // capability tests hold them together — but a clean error is better
+            // than a panic if they ever drift.
             (from, to) => Err(EngineError::UnsupportedPair { from, to }),
         }
     }
@@ -229,6 +312,43 @@ mod tests {
         assert_eq!(Format::from_path(Path::new("a.docx")), Some(Format::Docx));
         assert_eq!(Format::from_path(Path::new("a.txt")), None);
         assert_eq!(Format::from_path(Path::new("noextension")), None);
+    }
+
+    #[test]
+    fn a_bare_extension_names_a_format_with_or_without_its_dot() {
+        // A front end filters a queue by extension string, before it has a path
+        // to hand `from_path`.
+        assert_eq!(Format::from_extension("PDF"), Some(Format::Pdf));
+        assert_eq!(Format::from_extension(".docx"), Some(Format::Docx));
+        assert_eq!(Format::from_extension("txt"), None);
+        assert_eq!(Format::from_extension(""), None);
+    }
+
+    #[test]
+    fn the_capability_query_answers_for_every_known_format() {
+        assert_eq!(targets_for(Format::Pdf), vec![Format::Docx]);
+        assert_eq!(targets_for(Format::Docx), Vec::new());
+        assert_eq!(readers(), vec![Format::Pdf]);
+        assert_eq!(all_targets(), vec![Format::Docx]);
+    }
+
+    #[test]
+    fn every_promised_pair_has_a_dispatch_arm() {
+        // The query exists so a front end does not mirror `convert`'s match, and
+        // the reason it should not is that a mirror goes stale silently. That
+        // makes the table and the match agreeing an invariant rather than a
+        // detail: a row with no arm offers a conversion that fails at the last
+        // moment, one job per file, after the queue has already been accepted.
+        let dispatched = |from, to| matches!((from, to), (Format::Pdf, Format::Docx));
+        for &from in Format::ALL {
+            for &to in Format::ALL {
+                assert_eq!(
+                    supported_pair(from, to),
+                    dispatched(from, to),
+                    "{from} -> {to}: CONVERSIONS and the dispatch match disagree"
+                );
+            }
+        }
     }
 
     #[test]
