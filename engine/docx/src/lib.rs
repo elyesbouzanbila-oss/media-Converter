@@ -80,7 +80,23 @@ xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
     let mut zip = ZipWriter::new(Cursor::new(Vec::with_capacity(32 * 1024)));
     // Deflate rather than store: these are text-heavy XML parts that compress
     // by roughly 10x, and the CPU cost is negligible next to conversion.
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    //
+    // The timestamp is pinned, and it is the one field here that is easy to get
+    // wrong without noticing. `SimpleFileOptions::default()` stamps every entry
+    // with the current local time, so converting one document twice produced two
+    // different files — identical in every part, differing in exactly the four
+    // bytes of each entry's DOS time. That defeats the property the CLI and the
+    // GUI are held to (byte-identical output, which is how "no conversion logic
+    // leaked into a front end" is checked), and it defeats any caching keyed on
+    // content. It survived a spot check because DOS timestamps have two-second
+    // granularity and two runs in the same second agree.
+    //
+    // 1980-01-01 00:00:00 is the DOS epoch and the earliest representable, which
+    // is what reproducible-build tools generally choose. The value is arbitrary;
+    // that it never varies is the whole point.
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default());
 
     add_part(&mut zip, parts::part::CONTENT_TYPES, &parts::content_types(), options)?;
     add_part(&mut zip, parts::part::PACKAGE_RELS, &parts::package_rels(), options)?;

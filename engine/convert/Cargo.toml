@@ -14,3 +14,9 @@ dconv-docx = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+# Reading the produced .docx back, in the golden tests. The writer builds the
+# package by hand, so the reader that checks it deliberately does not.
+zip = { workspace = true }
+tempfile = { workspace = true }

@@ -72,8 +72,29 @@ const SCRIPT_RAISE_EM: f32 = 0.6;
 /// paragraph.
 ///
 /// Against the script alone it is too strict in the other direction, which is
-/// why both are kept: the real `3ème` raises a 6.96pt script 5.7pt above an
-/// 11.04pt baseline — 0.52 em of the base, and 0.82 of the script.
+/// why both are kept: the real `3ème` in `3IRS_TP2.pdf` measures 5.69pt between
+/// loose box bottoms against an 11.04pt base — 0.52 em of the base, and 0.82 of
+/// the 6.96pt script.
+///
+/// That 5.69pt is a *bottom* to *bottom* distance, not a baseline to baseline
+/// one, and the two are not interchangeable: the script sits 4.56pt above its
+/// base in baseline terms, so 1.13pt of the offset is nothing but the deeper
+/// loose box of the larger glyph. Both numbers are needed to reconstruct the
+/// geometry, and reading this constant as a baseline raise puts a synthetic
+/// script about 20% further from its base than the real one is — far enough to
+/// orphan it, which is how the fixture in `scripts/make_fixtures.py` first came
+/// out wrong.
+///
+/// Measuring bottoms rather than baselines also makes the bound tighten as the
+/// script shrinks, because the descent term grows with the size difference while
+/// the allowance shrinks with the script. At the measured proportions the offset
+/// is 0.82 of the script against a 0.9 bound; hold the raise at the same
+/// fraction of the base and shrink the script to half the base's size and the
+/// same arithmetic gives 1.10, which splits. The crossover is near 59%, and real
+/// superscripts routinely run 50-70%, so this is a live edge rather than a
+/// curiosity. No document here sits on it, so the measure is left alone: the fix
+/// would be to compare baselines, and both real documents would have to be
+/// re-measured to re-tune the three constants against the new quantity.
 const SCRIPT_RAISE_OWN: f32 = 0.9;
 
 /// How many existing bands a glyph is offered to before it starts a new one.
@@ -584,6 +605,39 @@ mod tests {
             runs.iter().any(|r| r.vertical == VerticalShift::Superscript),
             "the raised glyphs should be marked superscript: {runs:?}"
         );
+    }
+
+    #[test]
+    fn the_real_threescript_geometry_survives_the_constants() {
+        // `Groupes : 3ème` on page 1 of `3IRS_TP2.pdf`, which is the case the
+        // script constants were calibrated on. The sizes and the bottoms are the
+        // measured values (base 11.04pt at bottom 680.46, script 6.96pt at
+        // bottom 686.15); the x positions are laid out contiguously because the
+        // failure being guarded is vertical and that is the only part of the
+        // geometry worth reproducing exactly.
+        //
+        // The 5.69pt between those bottoms is 0.52 em of the base and 0.82 of
+        // the script, against bounds of 0.6 and 0.9. The margin on the second is
+        // 0.08, and it is the difference between `ème` annotating its digit and
+        // `ème` becoming a paragraph of its own three bands too high — which is
+        // silent, because the line it was taken from still reads correctly minus
+        // three characters. `a_superscript_joins_its_baseline_instead_of_orphaning`
+        // covers the same rule at a comfortable 4pt gap and would not notice the
+        // constants moving; this one would.
+        let mut glyphs = Vec::new();
+        let mut x = 0.0f32;
+        for ch in "Groupes : 3".chars() {
+            glyphs.push(glyph(ch, 11.04, x, x + 5.5, 680.46));
+            x += 5.5;
+        }
+        for ch in "ème".chars() {
+            glyphs.push(glyph(ch, 6.96, x, x + 4.0, 686.15));
+            x += 4.0;
+        }
+
+        let bands = analyse_page(&glyphs, 0.25);
+        assert_eq!(bands.len(), 1, "the real 3ème must not orphan: {bands:#?}");
+        assert_eq!(bands[0].text(), "Groupes : 3ème");
     }
 
     #[test]
