@@ -11,7 +11,7 @@ measurements behind them.
 - **Two owners, two directories.** The engine lives in `engine/`, the GUI lives in
   `app/`. Never edit across that line.
 - The engine works: `dconv file.pdf` produces a real `.docx` at **1.28 % word
-  error** on the primary test document. Everything is committed and 96 tests
+  error** on the primary test document. Everything is committed and 97 tests
   pass.
 - **The executables ship self-sufficient.** `pdfium.dll` is embedded in each one
   and unpacked into a version-keyed cache on first run, so one file runs on a
@@ -26,12 +26,16 @@ measurements behind them.
   gitignored private documents.
 - **The GUI converts.** The egui/eframe shell runs the real facade through a
   pool of worker *processes*; the demo pool is kept one swap away for
-  PDFium-free UI review. The formats the UI offers still mirror the facade by
-  hand — the facade's capability query has landed, and `app/src/engine.rs` has
-  yet to switch to it. See [the GUI section](#the-gui-app).
-- **The CLI has a pool too**, and it is where the byte-identical claim is
-  asserted: `dconv -j 4 *.pdf` re-runs this same executable as four workers, and
-  `engine/cli/tests/pool.rs` converts every fixture serially and in a pool and
+  PDFium-free UI review. The UI's format list comes from the facade's
+  capability query — the last hand-written mirror is an exhaustive
+  facade→UI mapping that fails to compile on a new facade format — and
+  `app/tests/worker_golden.rs` runs a real worker child over the committed
+  fixtures and asserts byte equality with the goldens. See
+  [the GUI section](#the-gui-app).
+- **The CLI has a pool too**, and it is where the CLI half of the
+  byte-identical claim is asserted: `dconv -j 4 *.pdf` re-runs this same
+  executable as four workers, and `engine/cli/tests/pool.rs` converts every
+  fixture serially and in a pool and
   compares with each other *and* with the committed goldens.
 - The real test PDFs are **gitignored**. Reproducing the numbers below needs
   somebody to drop the documents into `tests/fixtures/private/`.
@@ -94,7 +98,7 @@ findings are what survived.
 
 ```powershell
 cargo build  --profile spike            # whole workspace
-cargo test   --profile spike            # whole workspace, 96 tests
+cargo test   --profile spike            # whole workspace, 97 tests
 cargo build  -p dconv-cli --profile spike
 target\spike\dconv.exe --help
 
@@ -318,8 +322,9 @@ process fails** (finding A1). Consequences:
 
 ## The GUI (`app/`)
 
-The egui/eframe 0.37 shell is complete (19 tests) and converts for real: the
-facade runs in a pool of worker **processes**, not threads.
+The egui/eframe 0.37 shell is complete (20 tests including an end-to-end
+worker-vs-golden run in `app/tests/`) and converts for real: the facade runs
+in a pool of worker **processes**, not threads.
 
 ```
 app/src/main.rs       eframe setup; the worker-mode gate; picks the engine
@@ -370,13 +375,14 @@ Two facts a new agent should not trip over:
    counter can therefore never strand, short of a lost engine channel.
 
 Format honesty: the settings list and the accepted file extensions come from
-`engine::supported(ext)` / `readable(path)` in `app/src/engine.rs`, which still
-**mirror the facade's closed match by hand** (`Format::from_path` + the one
-supported pair, PDF → DOCX). The facade's capability query
-([above](#what-the-facade-can-do-ask-it-do-not-mirror-it)) has landed, so this can
-become three one-line delegations to `targets_for` / `all_targets` / `readers`;
-until then, **if the facade learns a new pair, the GUI offers nothing new until
-this mirror is updated.**
+`engine::supported(ext)` / `readable(path)`, which delegate to the facade's
+capability query — `Format::from_extension` plus `targets_for` / `all_targets`
+over the same `CONVERSIONS` table `convert` gates on. The one hand-written
+thing left is the facade-format → `TargetFormat` mapping
+(`target_of`), and it is an **exhaustive `match` on purpose**: when the facade
+learns a target the UI does not name, `app` fails to compile there and the UI
+owner classifies it — a new format can neither silently fail nor silently
+stay hidden.
 
 ### The demo engine
 
@@ -415,26 +421,25 @@ Contract, in order of how easy it is to get wrong:
 
 ---
 
-## What the GUI needs from the engine (contract asks)
+## What the GUI asks of the engine (contract ledger)
 
-The adapter is done. Two of the four asks have landed; what remains is small.
+Every cross-boundary ask has landed and is wired up:
 
-1. ~~**Re-export `PdfError` and `ReadStats` from `dconv-engine`**~~ — **landed.**
-   Both are re-exported alongside `Sink`, so a front end can match
-   `PdfError::Cancelled` by variant instead of by display string, and can name
-   `ReadStats` instead of taking the numbers apart as scalars. `warning_lines` in
-   `app/src/engine.rs` still does the latter, and no longer has to.
-2. ~~**A capability query** (`supported(ext) -> [targets]`)~~ — **landed**, as
-   `targets_for` / `readers` / `all_targets` over the one `CONVERSIONS` table
-   `convert` gates on. `engine::supported` can stop mirroring the closed match.
-3. **Byte-identical CLI vs GUI output is the standing assertion** that no
-   conversion logic leaked into a front end. The CLI half is now asserted on every
-   fixture by `engine/cli/tests/pool.rs`: serial and pooled runs, compared with
-   each other *and* with the committed goldens, so a mistake shared by both paths
-   still fails. The GUI half is writable and still to be written — and easier than
-   it looks, because the worker child already calls the exact
-   `Converter::convert` call the CLI does. The test is "the worker's output equals
-   the committed golden"; it needs no CLI involvement at all.
+1. ~~**Re-export `PdfError` and `ReadStats` from `dconv-engine`**~~ — landed.
+   `warning_lines` takes `&ReadStats` (the scalars helper is gone), and
+   `explain_error` matches `PdfError::Cancelled` by variant instead of by
+   display string.
+2. ~~**A capability query** (`supported(ext) -> [targets]`)~~ — landed.
+   `engine::supported` / `supported_targets` delegate to `targets_for` /
+   `all_targets`; the only hand-written piece is the exhaustive
+   facade→`TargetFormat` mapping described in the GUI section.
+3. ~~**The GUI half of byte-identical output is "the worker's output equals
+   the committed golden"**~~ — landed as `app/tests/worker_golden.rs`. The
+   test runs this executable as a real `--dconvert-worker` child, sends one
+   job per committed synthetic fixture over the frozen protocol (one
+   process, so it also proves the bind-once property across seven jobs), and
+   asserts the output bytes equal the goldens. No CLI involved, as
+   specified.
 4. **Progress granularity is per page.** Fine as it is; extend `Sink` only if the
    UI genuinely needs more, keeping the CLI on the same interface or the outputs
    can drift.
@@ -581,12 +586,13 @@ GUI shell with its real engine (worker-process pool around the facade).
 landed when; this file deliberately names no commit hashes, because a hash in a
 document goes stale the moment anyone commits.
 
-**Tests:** 96 — `dconv-ir` 17, `dconv-pdf` 30 (23 geometry, plus the seven bind
+**Tests:** 97 — `dconv-ir` 17, `dconv-pdf` 30 (23 geometry, plus the seven bind
 tests that pin what is embedded and how it is unpacked), `dconv-docx` 12,
 `dconv-engine` 9 (eight unit plus the end-to-end golden test), `dconv-cli` 9
 (seven unit, plus two end-to-end pool runs that compare a pooled run with a serial
-one and with the goldens), `dconv-app` 19 (nine queue/settings, two log, eight
-engine protocol).
+one and with the goldens), `dconv-app` 20 (nine queue/settings, two log, eight
+engine protocol, plus the end-to-end worker-vs-golden run in `app/tests/`, which
+skips on a tree that lacks pdfium.dll).
 All green. The engine counts are the engine owner's to move; the app count the UI
 owner's.
 
@@ -604,13 +610,10 @@ owner's.
    only. Size alone cannot fix it. The document offers a second signal: genuine
    headings sit 18–30 pt below the preceding line against a 14 pt body pitch,
    while the note's lines sit 14.5–16.5 pt apart. This is finding D13.
-3. **GUI polish with measurements behind it.** The worker pool, per-page live
-   progress and mid-batch cancel are in the M1 adapter. What remains: an ETA in
-   the top bar (computable from the per-page progress rate); the GUI-vs-CLI
-   golden comparison — the byte-identical assertion's GUI half, which needs no
-   CLI at all, just a comparison of the worker child's output with the committed
-   goldens; and switching `engine::supported` from its hand-written mirror to the
-   facade's capability query, which has landed.
+3. **An ETA in the GUI's top bar**, computable from the per-page progress rate
+   the worker pool already reports. The worker pool, per-page live progress,
+   mid-batch cancel, the capability delegation and the GUI-vs-CLI golden
+   comparison are all in the adapter and its tests now.
 4. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
    when the closed `match` in the facade becomes a real registry.
 5. **Multi-column reading order.** `tests/fixtures/synthetic/columns.pdf` pins the
@@ -638,9 +641,8 @@ owner's.
    `--licenses` flag: a redistributor has to be able to pass the notices on, and
    a folder is easier to hand on than a flag. It does mean the deliverable is a
    folder and not one file, which is worth knowing before anyone promises "one
-   file" to somebody. Still missing: `#![windows_subsystem = "windows"]` in
-   `app/src/main.rs` (the UI owner's file), so the GUI build opens a console
-   window behind it; and notices for the Rust crates the executables link —
+   file" to somebody. Still missing: notices for the Rust crates the
+   executables link —
    `Cargo.lock` holds 698 packages across every platform and target, and even
    the Windows subset is too many to write out by hand. `cargo-about` is the
    tool for collecting those properly and nothing here does it yet; the
