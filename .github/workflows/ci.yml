@@ -1,0 +1,118 @@
+name: CI
+
+# Validates what lands: the workspace builds and tests green, the committed
+# goldens are byte-identical afterwards (no accidental re-blessing), and the
+# packaging step still produces executables that carry PDFium and notices that
+# are verbatim upstream copies.
+#
+# Everything runs on Windows: the reader binds a vendored win-x64 PDFium, the
+# fetch and packaging scripts are PowerShell, and the GUI is a Windows binary.
+#
+# Deliberately not gated yet: `cargo fmt --check` and `cargo clippy -D warnings`.
+# Neither is clean in the tree today, and turning them on from CI would mean
+# either suppressing warnings or reformatting across the engine/app ownership
+# line. Add them once the tree is clean.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test-package:
+    name: Build, test, package
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      # Gitignored, and required before the build: build.rs embeds the library
+      # only if it is present at compile time. The script also touches build.rs
+      # so cargo cannot miss a library that arrived after the last build.
+      - name: Fetch PDFium
+        shell: pwsh
+        run: ./scripts/fetch-pdfium.ps1
+
+      - name: Build
+        run: cargo build --workspace --profile spike --locked
+
+      # Includes the three end-to-end fixture tests: the engine's golden test,
+      # the CLI's serial-vs-pool test, and the GUI worker-vs-golden test. The
+      # private-document fidelity harnesses cannot run here; those documents are
+      # gitignored by design.
+      - name: Test
+        run: cargo test --workspace --profile spike --locked
+
+      # DCONV_BLESS is never set in CI, so any diff here is an accidental or
+      # committed re-bless that nobody read.
+      - name: Goldens unchanged
+        shell: bash
+        run: git diff --exit-code -- tests/fixtures/synthetic
+
+      # The same check the release packaging performs - each executable must
+      # contain the vendored library's bytes - on the faster spike profile, so
+      # CI does not pay fat LTO on every run.
+      - name: Package and assert PDFium is embedded
+        shell: pwsh
+        run: ./scripts/package.ps1 -Profile spike -SkipBuild
+
+      # The README and LICENSES/README.txt say the notices are copied verbatim.
+      # This is what makes that true rather than aspirational.
+      - name: Notices are verbatim
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $dist = 'dist/LICENSES'
+          $upstream = Get-ChildItem 'third_party/pdfium/licenses' -File
+
+          foreach ($file in $upstream) {
+              $copy = Join-Path $dist $file.Name
+              if (-not (Test-Path $copy)) {
+                  throw "LICENSES is missing $($file.Name)"
+              }
+              if ((Get-FileHash $file.FullName).Hash -ne (Get-FileHash $copy).Hash) {
+                  throw "$($file.Name) was modified, not copied verbatim"
+              }
+          }
+
+          $repackager = 'third_party/pdfium/LICENSE'
+          $packaged = Join-Path $dist 'pdfium-binaries.txt'
+          if (-not (Test-Path $packaged)) {
+              throw 'LICENSES is missing pdfium-binaries.txt'
+          }
+          if ((Get-FileHash $repackager).Hash -ne (Get-FileHash $packaged).Hash) {
+              throw 'pdfium-binaries.txt does not match the distribution licence'
+          }
+
+          if (-not (Test-Path (Join-Path $dist 'README.txt'))) {
+              throw 'LICENSES/README.txt is missing'
+          }
+
+          $count = (Get-ChildItem $dist -File).Count
+          $expected = $upstream.Count + 2
+          if ($count -ne $expected) {
+              throw "expected $expected files in LICENSES, found $count"
+          }
+
+          Write-Host "  $($upstream.Count) upstream notices + repackager licence + README.txt"
