@@ -209,6 +209,100 @@ the pool wastes CPU and process churn, not memory.
 
 ---
 
+## Real documents — the first honest test
+
+Two genuine course handouts (French, 5 and 6 pages) arrived after the synthetic
+fixtures. They immediately falsified an assumption the fixtures could not reach,
+and supplied the baseline the synthetic set never could.
+
+### Finding D1 — a fixed fraction of the font size is the wrong word-gap rule
+
+Space inference thresholded on `gap > size * 0.25`. On real text that rule was
+**simultaneously too strict and too loose for different spaces in the same
+document**, because this font's space is *narrower* than the assumed 0.25 em:
+
+```
+        1  x=466.15  width=5.58  advance=8.00  gap=+2.42   <- a real space
+   U+0020  x=488.14  width=2.49                          <- the font's own space
+```
+
+The gap after `1` is 2.42 pt and the document's own space glyph is 2.49 pt wide,
+but the threshold was `11 pt * 0.25 = 2.75 pt`. A genuine space measured *below*
+the threshold and was deleted. Every corruption, confirmed against MuPDF:
+
+| ours (wrong) | MuPDF (correct) | occurrences |
+|---|---|---|
+| `Page 1sur 6` | `Page 1 sur 6` | 1 |
+| `(sousOracle)` | `(sous Oracle)` | 4 |
+| `MVet l'hôte` | `MV et l'hôte` | 10 |
+
+Intra-word noise is at most ±0.4 pt, so the two distributions are cleanly
+separated. Only the threshold's location was wrong.
+
+**Fix:** measure the page's own space width from its `U+0020` glyphs, take the
+median (not the mean, so stretched justified spaces cannot drag it upwards), and
+threshold at a third of that. Measured value on these documents: **0.203 em**,
+against the assumed 0.25 em.
+
+### Finding D2 — quantified against an independent implementation
+
+`scripts/compare_text.py` diffs our reconstruction against PyMuPDF (MuPDF).
+MuPDF rather than PDFium deliberately: PDFium is the engine under test, so a
+shared engine would hide engine-specific mistakes behind a shared opinion.
+
+| Document | Before | After |
+|---|---|---|
+| `3IRS_TP2.pdf` (1640 tokens) | 13.84% WER | **1.46%** |
+| `TP2 Admin BD` (2022 tokens) | 8.41% WER | **6.92%** |
+
+The shape of the residual matters more than its size:
+
+| Document | missing tokens | extra tokens |
+|---|---|---|
+| `3IRS_TP2.pdf` | 2 | 3 |
+| `TP2 Admin BD` | 3 | 3 |
+
+**Only five words in 1640, and six in 2022, are actually lost or invented.** The
+remaining error is *reordering* — the layout analyser's job in Phase 1, not an
+extraction defect. Word extraction is for practical purposes complete on these
+documents.
+
+### Finding D3 — control characters leak from font encodings
+
+Two hyphens arrived as `U+0002`, because the font's encoding maps that glyph to a
+control code. The character it should have been is unrecoverable from the page
+description alone.
+
+**Fix:** drop C0/C1 control characters. Emitting a raw control byte is strictly
+worse than dropping it — it silently poisons the text, the XML and then the
+DOCX. The cost is a lost hyphen in `entre-` and `ci-`, recorded as a known
+limitation rather than hidden.
+
+### Finding D4 — superscripts orphan onto their own lines
+
+`2ème` split, leaving a line holding only `ème` at 7pt. The superscript sits
+9.2 pt off an 11 pt baseline, beyond the 5.5 pt tolerance. Phase 1 needs
+explicit superscript handling rather than treating every off-baseline glyph as a
+new line.
+
+### Finding D5 — line style must not be the maximum glyph size
+
+`• Tester différents moyens…` was reported at 14 pt where its text is 12 pt: the
+bullet glyph is set larger than the body it introduces, and line size was taken
+as the maximum. A dominant size weighted by glyph count, or the modal size, is
+correct; the maximum is not. This is the same class of error as finding A3, and
+points the same way — derive line properties from the bulk of the line, never
+from one extreme member.
+
+### Finding D6 — two-column tables already read correctly
+
+`Propriété Description` followed by `Atomicité La transaction s'exécute…` shows
+cell structure surviving intact in the x-gaps. The 2-D segmentation from finding
+A4 is the right shape for this; what it needs is the column/cell split, not a
+redesign.
+
+---
+
 ## Corrections to the original plan
 
 1. **Static PDFium linking is not possible** from the bblanchon distribution —
@@ -233,10 +327,14 @@ the pool wastes CPU and process churn, not memory.
 
 ## Open questions for Phase 1
 
-- Real sample documents are still the highest-value input. The synthetic
-  fixtures cannot exercise embedded font subsets, ligatures, rotated text, or
-  genuine multi-column detection.
-- Table reconstruction needs the x-segmentation stage from finding A4 before it
-  can be evaluated at all.
+- Reading order in multi-column and table layouts is now the dominant source of
+  error, measured, not guessed: ~134 of 140 remaining token differences on the
+  second real document (finding D2). Table reconstruction needs the
+  x-segmentation stage from finding A4 before it can even be evaluated.
+- Superscript and subscript attachment (finding D4) has no implementation yet.
+- Dominant line size by glyph count instead of maximum (finding D5) is a
+  one-line change that has not been made.
 - Whether heading inference should use font size against the document's modal
-  size, or against a per-page distribution, is unresolved and needs real input.
+  size, or against a per-page distribution, is still unresolved. On the first
+  real document, H1 and H2 are both 13 pt and differ only by italic, so size
+  alone will not separate them.

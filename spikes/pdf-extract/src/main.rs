@@ -39,6 +39,15 @@ struct Glyph {
     /// typesetting engine advances the pen by, which is the quantity we
     /// actually want.
     x: f32,
+    /// Pen position for this glyph, straight from PDFium (`FPDFText_GetCharOrigin`).
+    ///
+    /// Distinct from `x`, which is the left edge of the advance box. The two are
+    /// usually identical, but the *difference* between consecutive origin
+    /// positions is the advance actually consumed — the ground truth for whether
+    /// the producer elided a space. Comparing advance boxes instead conflates a
+    /// glyph's own width with whatever follows it, which is why a threshold
+    /// expressed as a fraction of the font size misfires in both directions.
+    origin_x: f32,
     /// Right edge of the advance box. Kept alongside `x` because inter-glyph
     /// gaps are what let us decide whether a space was elided between words.
     right: f32,
@@ -99,6 +108,12 @@ struct Report {
     load: Duration,
     extract: Duration,
     spaces: SpaceStats,
+    /// Measured space width as a fraction of font size, averaged over pages.
+    ///
+    /// Reported because it is the quantity the word-gap threshold is derived
+    /// from, and it varies by font. The first real document tested against has
+    /// a space of 0.226 em, against an assumed 0.25 em.
+    space_em: f32,
     /// Synthetic characters PDFium inserted that we discarded as having no
     /// usable geometry.
     synthetic_dropped: usize,
@@ -107,12 +122,14 @@ struct Report {
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0].starts_with("--") {
-        eprintln!("usage: spike-pdf-extract <file.pdf> [--dump N] [--repeat N] [--quiet]");
+        eprintln!("usage: spike-pdf-extract <file.pdf> [--dump N] [--repeat N]");
         eprintln!();
         eprintln!("  --dump N     print the first N pages of reconstructed lines");
         eprintln!("  --raw N      dump the first N raw glyphs of page 1, with codepoints");
         eprintln!("  --repeat N   run the extraction N times and report each run");
         eprintln!("  --quiet      print one machine-readable RESULT line and nothing else");
+        eprintln!("  --text       print every page's reconstructed text, one line each");
+        eprintln!("  --space-em F override the measured space width, in em (default: measured)");
         std::process::exit(2);
     }
 
@@ -121,6 +138,8 @@ fn main() -> Result<()> {
     let raw = flag(&argv, "--raw").unwrap_or(0);
     let repeat = flag(&argv, "--repeat").unwrap_or(1).max(1);
     let quiet = argv.iter().any(|a| a == "--quiet");
+    let text_only = argv.iter().any(|a| a == "--text");
+    let space_em_override = float_flag(&argv, "--space-em");
 
     let lib_dir = dll_dir();
     let lib = Pdfium::pdfium_platform_library_name_at_path(&lib_dir);
@@ -141,11 +160,15 @@ fn main() -> Result<()> {
         return dump_raw(&pdfium, &path, raw);
     }
 
+    if text_only {
+        return dump_text(&pdfium, &path, space_em_override);
+    }
+
     let mut last: Option<Report> = None;
     for run in 1..=repeat {
         // Dump on the final run only, so a warm run is what gets printed.
         let this_dump = if run == repeat { dump } else { 0 };
-        let report = run_once(&pdfium, &path, this_dump)?;
+        let report = run_once(&pdfium, &path, this_dump, space_em_override)?;
         if repeat > 1 && !quiet {
             println!(
                 "  run {run}/{repeat}: load {:.1} ms, extract {:.1} ms",
@@ -174,7 +197,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_once(pdfium: &Pdfium, path: &Path, dump: usize) -> Result<Report> {
+fn run_once(
+    pdfium: &Pdfium,
+    path: &Path,
+    dump: usize,
+    space_em_override: Option<f32>,
+) -> Result<Report> {
     let t_load = Instant::now();
     let doc = pdfium
         .load_pdf_from_file(path, None)
@@ -189,22 +217,44 @@ fn run_once(pdfium: &Pdfium, path: &Path, dump: usize) -> Result<Report> {
     let mut dumped: Vec<(usize, Vec<Line>)> = Vec::new();
 
     let t_extract = Instant::now();
+    let mut space_em_total = 0.0f32;
+    let mut space_em_pages = 0usize;
+
     for (index, page) in doc.pages().iter().enumerate() {
         let (page_glyphs, dropped) = extract_page(&page)
             .with_context(|| format!("extracting page {}", index + 1))?;
         glyphs += page_glyphs.len();
         synthetic_dropped += dropped;
 
+        // Calibrate the word-gap threshold against this page's own space
+        // characters rather than assuming a fraction of the font size. The
+        // assumption was wrong in a way that only real documents exposed: this
+        // font's space is 0.226 em, so a 0.25 em threshold sat *above* a genuine
+        // space and silently deleted it, while still catching wider spaces
+        // elsewhere. The rule was simultaneously too strict and too loose for
+        // different spaces in the same document.
+        let page_space_em = space_em_override.unwrap_or_else(|| measure_space_em(&page_glyphs));
+        if space_em_override.is_none() {
+            space_em_total += page_space_em;
+            space_em_pages += 1;
+        }
+
         // Clone only for the few pages we intend to print; cloning every page
         // would pollute the timing we are trying to measure.
         let want = index < dump;
-        let page_lines = group_lines(page_glyphs, &mut spaces);
+        let page_lines = group_lines(page_glyphs, &mut spaces, page_space_em);
         lines += page_lines.len();
         if want {
             dumped.push((index + 1, page_lines));
         }
     }
     let extract = t_extract.elapsed();
+
+    let space_em = match space_em_override {
+        Some(value) => value,
+        None if space_em_pages > 0 => space_em_total / space_em_pages as f32,
+        None => DEFAULT_SPACE_EM,
+    };
 
     for (page_no, page_lines) in &dumped {
         println!("\n===== page {page_no} — {} lines =====", page_lines.len());
@@ -227,6 +277,7 @@ fn run_once(pdfium: &Pdfium, path: &Path, dump: usize) -> Result<Report> {
         load,
         extract,
         spaces,
+        space_em,
         synthetic_dropped,
     })
 }
@@ -247,6 +298,16 @@ fn extract_page(page: &PdfPage) -> Result<(Vec<Glyph>, usize)> {
             continue;
         };
         if c == '\0' || c == '\u{FFFE}' || c == '\u{FFFF}' {
+            continue;
+        }
+
+        // C0 and C1 control codes are never text. They surface when a font's
+        // encoding maps a glyph to an undefined or private code — a font-level
+        // defect whose correct character is genuinely unrecoverable from the
+        // page description alone. Emitting the raw code point is strictly worse
+        // than dropping it, because it silently poisons every downstream
+        // consumer: the text, the XML, and finally the DOCX.
+        if c.is_control() {
             continue;
         }
 
@@ -278,6 +339,7 @@ fn extract_page(page: &PdfPage) -> Result<(Vec<Glyph>, usize)> {
         out.push(Glyph {
             ch: c,
             x: loose.left().value,
+            origin_x: ch.origin_x().map(|p| p.value).unwrap_or(loose.left().value),
             right: loose.right().value,
             ink_left: ch
                 .tight_bounds()
@@ -324,7 +386,7 @@ fn is_bold(weight: Option<PdfFontWeight>, lower_name: &str) -> bool {
 /// This is the seed of the real layout analyser. It is deliberately naive here
 /// -- one tolerance, no column awareness, no rotation handling -- because the
 /// point of the spike is only to prove the coordinates are usable.
-fn group_lines(mut glyphs: Vec<Glyph>, stats: &mut SpaceStats) -> Vec<Line> {
+fn group_lines(mut glyphs: Vec<Glyph>, stats: &mut SpaceStats, space_em: f32) -> Vec<Line> {
     // PDF y grows upwards, so sort descending by baseline to go down the page,
     // and ascending by x to go left to right within a line.
     glyphs.sort_by(|a, b| {
@@ -359,12 +421,12 @@ fn group_lines(mut glyphs: Vec<Glyph>, stats: &mut SpaceStats) -> Vec<Line> {
 
     groups
         .into_iter()
-        .map(|g| Line::from_glyphs(g, stats))
+        .map(|g| Line::from_glyphs(g, stats, space_em))
         .collect()
 }
 
 impl Line {
-    fn from_glyphs(mut glyphs: Vec<Glyph>, stats: &mut SpaceStats) -> Self {
+    fn from_glyphs(mut glyphs: Vec<Glyph>, stats: &mut SpaceStats, space_em: f32) -> Self {
         glyphs.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal));
 
         let size = glyphs.iter().map(|g| g.size).fold(0.0f32, f32::max);
@@ -373,10 +435,19 @@ impl Line {
         let italic_count = glyphs.iter().filter(|g| g.italic).count();
         let italic = !glyphs.is_empty() && italic_count * 2 >= glyphs.len();
 
-        // Reinsert the spaces that PDF omits: a gap wider than a quarter of the
-        // font size means the producer positioned the next word rather than
-        // emitting a space character. Compared against advance boxes, so
-        // narrow glyphs like `.` and `i` do not trigger phantom spaces.
+        // Reinsert the spaces that PDF omits: producers very often position each
+        // word individually instead of emitting a space character at all.
+        //
+        // The threshold is calibrated, not guessed. `space_em` is this page's
+        // measured space width as a fraction of the font size, and the test is a
+        // third of that: comfortably above the sub-point noise between adjacent
+        // letters, comfortably below a real space. Assuming a fixed fraction of
+        // the font size instead puts the threshold *inside* the distribution of
+        // real spaces, so it misses some and invents others.
+        //
+        // Compared against advance boxes, so narrow glyphs like `.` and `i` do
+        // not trigger phantom spaces.
+        let gap_threshold = size * space_em * 0.33;
         let mut text = String::new();
         let mut previous_right: Option<f32> = None;
         for glyph in &glyphs {
@@ -390,7 +461,7 @@ impl Line {
 
             if let Some(prev) = previous_right {
                 let gap = glyph.x - prev;
-                if gap > size * 0.25 && glyph.ch != ' ' && !text.ends_with(' ') {
+                if gap > gap_threshold && glyph.ch != ' ' && !text.ends_with(' ') {
                     text.push(' ');
                     stats.inferred += 1;
                 }
@@ -484,7 +555,81 @@ fn dump_raw(pdfium: &Pdfium, path: &Path, limit: usize) -> Result<()> {
         );
     }
 
+    dump_positions(&glyphs, 90);
+
     Ok(())
+}
+
+/// Print glyphs in page order (top-left to bottom-right) with the advance
+/// arithmetic spelled out, so a human can see whether a word gap resembles a
+/// space character.
+///
+/// Sorted by position rather than content-stream order, because producers are
+/// free to emit the right half of a line before the left half. Only the last
+/// `tail` entries are shown, which is where footers live — and the footer is
+/// usually the most heavily laid-out part of a page, since it is assembled from
+/// separately positioned runs rather than flowing text.
+fn dump_positions(glyphs: &[Glyph], tail: usize) {
+    let mut sorted: Vec<&Glyph> = glyphs.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.bottom
+            .partial_cmp(&a.bottom)
+            .unwrap_or(Ordering::Equal)
+            .then(a.x.partial_cmp(&b.x).unwrap_or(Ordering::Equal))
+    });
+
+    let start = sorted.len().saturating_sub(tail);
+    println!(
+        "\n  last {} glyphs by page position, with advance arithmetic:",
+        sorted.len() - start
+    );
+    println!(
+        "  {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>7}  {}",
+        "char", "size", "x", "origin", "right", "width", "adv", "adv-w", "verdict"
+    );
+
+    for (i, g) in sorted.iter().enumerate().skip(start) {
+        let width = g.right - g.x;
+
+        // The advance actually consumed is the distance to the next glyph's pen
+        // origin, measured only against glyphs on the same baseline at the same
+        // size. Anything else is a separate run, not a continuation of this one.
+        let next = sorted
+            .get(i + 1)
+            .filter(|n| (n.bottom - g.bottom).abs() < 0.5 && (n.size - g.size).abs() < 0.25);
+        let adv = next.map(|n| n.origin_x - g.origin_x);
+        let extra = adv.map(|a| a - width);
+
+        // A Latin space is roughly 0.25-0.33 em. The band below is deliberately
+        // loose: the purpose of this dump is to show the distribution, and a
+        // sharper threshold would be false confidence dressed as precision.
+        let verdict = match extra {
+            Some(e) if e > g.size * 0.16 => "GAP",
+            Some(e) if e < -g.size * 0.04 => "overlap",
+            _ => "",
+        };
+
+        let shown = if g.ch.is_whitespace() {
+            format!("U+{:04X}", g.ch as u32)
+        } else {
+            g.ch.to_string()
+        };
+
+        println!(
+            "  {:>7} {:>7.2} {:>8.2} {:>8.2} {:>7.2} {:>7.2} {:>8} {:>7}  {}",
+            shown,
+            g.size,
+            g.x,
+            g.origin_x,
+            g.right,
+            width,
+            adv.map(|a| format!("{a:.2}")).unwrap_or_else(|| "-".into()),
+            extra
+                .map(|e| format!("{e:+.2}"))
+                .unwrap_or_else(|| "-".into()),
+            verdict
+        );
+    }
 }
 
 fn print_report(path: &Path, r: &Report, bind: Duration, repeat: usize) {
@@ -521,6 +666,10 @@ fn print_report(path: &Path, r: &Report, bind: Duration, repeat: usize) {
         r.spaces.literal, r.spaces.pdfium, r.spaces.inferred
     );
     println!(
+        "  space width     {:>12.4} em  (measured; drives the word-gap threshold)",
+        r.space_em
+    );
+    println!(
         "  synthetic drops {:>12}",
         r.synthetic_dropped
     );
@@ -539,6 +688,11 @@ fn flag(args: &[String], name: &str) -> Option<usize> {
     args.get(idx + 1)?.parse().ok()
 }
 
+fn float_flag(args: &[String], name: &str) -> Option<f32> {
+    let idx = args.iter().position(|a| a == name)?;
+    args.get(idx + 1)?.parse().ok()
+}
+
 /// Where to load `pdfium.dll` from.
 fn dll_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("PDFIUM_DLL_DIR") {
@@ -551,4 +705,56 @@ fn dll_dir() -> PathBuf {
         .join("third_party")
         .join("pdfium")
         .join("bin")
+}
+
+/// Fallback space width in em, used only when a page contains no space
+/// characters to measure. 0.25 is the value the original heuristic assumed.
+const DEFAULT_SPACE_EM: f32 = 0.25;
+
+/// Measure a page's space width as a fraction of the font size.
+///
+/// A PDF's space character has a real advance box, so the document states its
+/// own space width; there is no need to guess from the font size. The median is
+/// used rather than the mean so that a few stretched justified spaces cannot
+/// drag the estimate upwards — the threshold derived from this has to stay below
+/// the *narrowest* real space, not the average one.
+fn measure_space_em(glyphs: &[Glyph]) -> f32 {
+    let mut ratios: Vec<f32> = glyphs
+        .iter()
+        .filter(|g| g.ch == ' ' && !g.generated && g.size > 0.0)
+        .map(|g| (g.right - g.x) / g.size)
+        .filter(|r| *r > 0.02 && *r < 1.0)
+        .collect();
+
+    if ratios.is_empty() {
+        return DEFAULT_SPACE_EM;
+    }
+
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    ratios[ratios.len() / 2]
+}
+
+/// Print the reconstructed text of every page, one output line per text line.
+///
+/// Exists so that reconstruction can be diffed against an independent
+/// extractor. Text quality is not something to eyeball at scale; an external
+/// reference turns "looks about right" into a number that can regress.
+fn dump_text(pdfium: &Pdfium, path: &Path, space_em_override: Option<f32>) -> Result<()> {
+    let doc = pdfium
+        .load_pdf_from_file(path, None)
+        .with_context(|| format!("opening {}", path.display()))?;
+
+    let mut stats = SpaceStats::default();
+    for page in doc.pages().iter() {
+        let (glyphs, _) = extract_page(&page)?;
+        let space_em = space_em_override.unwrap_or_else(|| measure_space_em(&glyphs));
+        for line in group_lines(glyphs, &mut stats, space_em) {
+            let text = line.text.trim();
+            if !text.is_empty() {
+                println!("{text}");
+            }
+        }
+    }
+
+    Ok(())
 }
