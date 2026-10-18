@@ -48,6 +48,16 @@ pub enum PdfError {
     #[error("PDFium at {library} could not be bound: {reason}")]
     Bind { library: String, reason: String },
 
+    #[error("this build carries no copy of PDFium to unpack")]
+    NoEmbeddedLibrary,
+
+    #[error("{context}: {source}")]
+    Unpack {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("{context}: {source}")]
     Engine {
         context: String,

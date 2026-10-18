@@ -11,8 +11,12 @@ measurements behind them.
 - **Two owners, two directories.** The engine lives in `engine/`, the GUI lives in
   `app/`. Never edit across that line.
 - The engine works: `dconv file.pdf` produces a real `.docx` at **1.28 % word
-  error** on the primary test document. Everything is committed and 89 tests
+  error** on the primary test document. Everything is committed and 96 tests
   pass.
+- **It ships as one file.** `pdfium.dll` is embedded in the executable and
+  unpacked into a version-keyed cache on first run, so a build runs on a machine
+  that has never seen PDFium. Measured end to end, not argued: see
+  [the single-file check](#checking-the-single-file-claim).
 - **Conversion is byte-for-byte reproducible, and that is now asserted.** Seven
   committed fixtures under `tests/fixtures/synthetic/` are converted end to end
   and checked against a committed `.docx` each, so a fresh clone can run a real
@@ -62,7 +66,8 @@ build. That is why the member list is explicit.
 ```
 engine/
   ir/          dconv-ir        the Doc IR: the contract between reader and writer
-  pdf/         dconv-pdf       PDFium binding, glyph extraction, layout analysis
+  pdf/         dconv-pdf       PDFium binding, glyph extraction, layout analysis;
+                              build.rs embeds the vendored library in the binary
   docx/        dconv-docx      the writer (hand-built zip + XML)
   convert/     dconv-engine    the facade the CLI and GUI both call
   cli/         dconv-cli       the `dconv` binary
@@ -86,7 +91,7 @@ findings are what survived.
 
 ```powershell
 cargo build  --profile spike            # whole workspace
-cargo test   --profile spike            # whole workspace, 89 tests
+cargo test   --profile spike            # whole workspace, 96 tests
 cargo build  -p dconv-cli --profile spike
 target\spike\dconv.exe --help
 ```
@@ -111,6 +116,40 @@ Bootstrap PDFium once — it is gitignored:
 source of truth for it. Keep them in step; `pdfium-render 0.9.4` generates
 bindings for the `chromium/7881` API, so newer drops are a safe superset and older
 ones are not.
+
+**Order matters for the deliverable.** The fetch has to happen before the build
+that ships, because `engine/pdf/build.rs` embeds the vendored library only if it
+is there when the crate is compiled; a tree built without it still compiles, but
+the binary carries nothing and will need a `pdfium.dll` next to it. The build
+script watches the file, so a fetch followed by a build always picks it up.
+
+### Checking the single-file claim
+
+The embed cannot be asserted in the test suite, because every bind on this machine
+would find the vendored library first. So it is a procedure, run when the claim
+matters (a release, or a change to `bind.rs`):
+
+1. Rename `third_party/pdfium/bin/pdfium.dll` aside, and delete
+   `%LOCALAPPDATA%\docconvert\pdfium\8100\` if it exists — the two ways the
+   library could still be found on disk.
+2. Copy `target\spike\dconv.exe` (or the release build) into an empty directory of
+   its own, with no other file in it.
+3. Run it over any fixture from there. It must convert, and it must leave a
+   `pdfium.dll` in the cache directory, byte-identical to the one that was
+   renamed aside.
+4. Run it again: the second run must not rewrite the cached copy, because the
+   cache is one of the searched directories and a hit skips unpacking entirely.
+5. Put the vendored library back — and do not rebuild while it is aside, since a
+   build in that window is a build with no embedded copy.
+
+Step 3's output is worth diffing against the committed golden while the tree is in
+that state: a converter that unpacks its library correctly and a converter that
+converts correctly are two different claims.
+
+What is *asserted* is the part with no environment in it: the bytes this build
+carries are the vendored library's, byte for byte; unpacking is idempotent, repairs
+a damaged cache copy, replaces one left by a different build, and tolerates four
+threads doing it at once. Those are the seven tests in `bind.rs`.
 
 ---
 
@@ -241,11 +280,12 @@ process fails** (finding A1). Consequences:
   speak one JSON object per line over its pipes. Re-running itself is what keeps
   the deliverable one file, and it means a worker can never be a different build
   from the parent that spawned it.
-- For single-file delivery, the plan is to embed `pdfium.dll` with
-  `include_bytes!` and extract it to a version-keyed cache on first run — **still
-  to be written** (gap 4). Until then the DLL sits beside the `.exe`, or is found
-  by the search in `bind.rs`. Static linking is not possible (`lib/pdfium.dll.lib`
-  is an *import* library) — see the corrections section of the findings.
+- For single-file delivery the DLL is embedded with `include_bytes!` and unpacked
+  into a version-keyed cache on first run — in `engine/pdf/build.rs` and
+  `bind::unpack_embedded`. A build carries the copy only if the vendored library
+  was present when it was compiled, so the fetch script must run *before* the
+  build that ships. Static linking is not possible (`lib/pdfium.dll.lib` is an
+  *import* library) — see the corrections section of the findings.
 
 ---
 
@@ -514,10 +554,12 @@ GUI shell with its real engine (worker-process pool around the facade).
 landed when; this file deliberately names no commit hashes, because a hash in a
 document goes stale the moment anyone commits.
 
-**Tests:** 89 — `dconv-ir` 17, `dconv-pdf` 23, `dconv-docx` 12, `dconv-engine` 9
-(eight unit plus the end-to-end golden test), `dconv-cli` 9 (seven unit, plus two
-end-to-end pool runs that compare a pooled run with a serial one and with the
-goldens), `dconv-app` 19 (nine queue/settings, two log, eight engine protocol).
+**Tests:** 96 — `dconv-ir` 17, `dconv-pdf` 30 (23 geometry, plus the seven bind
+tests that pin what is embedded and how it is unpacked), `dconv-docx` 12,
+`dconv-engine` 9 (eight unit plus the end-to-end golden test), `dconv-cli` 9
+(seven unit, plus two end-to-end pool runs that compare a pooled run with a serial
+one and with the goldens), `dconv-app` 19 (nine queue/settings, two log, eight
+engine protocol).
 All green. The engine counts are the engine owner's to move; the app count the UI
 owner's.
 
@@ -542,16 +584,15 @@ owner's.
    CLI at all, just a comparison of the worker child's output with the committed
    goldens; and switching `engine::supported` from its hand-written mirror to the
    facade's capability query, which has landed.
-4. **PDFium DLL embed-to-cache** (`include_bytes!`) for the single portable `.exe`.
-5. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
+4. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
    when the closed `match` in the facade becomes a real registry.
-6. **Multi-column reading order.** `tests/fixtures/synthetic/columns.pdf` pins the
+5. **Multi-column reading order.** `tests/fixtures/synthetic/columns.pdf` pins the
    current behaviour, which is wrong: text is read *across* the columns rather than
    down each one, so a sentence from the left column has the right column's opening
    line spliced into it, and the rows that do align are taken for a table. No
    document here has needed it, which is why it is this far down — but the fixture
    makes the day one does a deliberate diff rather than a surprise.
-7. **The superscript bound tightens as the script gets smaller.** The bander
+6. **The superscript bound tightens as the script gets smaller.** The bander
    measures a script's raise between loose box *bottoms*, and a smaller glyph has a
    shallower box, so the difference in descent is added to the offset it compares
    against a bound that shrinks with the script. At the measured proportions the
@@ -562,6 +603,16 @@ owner's.
    Comparing baselines rather than bottoms is the fix; both real documents would
    have to be re-measured to re-tune the constants against the new quantity. Full
    detail in `SCRIPT_RAISE_OWN`'s comment in `engine/pdf/src/layout.rs`.
+7. **Packaging — and the notices that go with it.** The embed makes the binary
+   self-sufficient, but nothing assembles a release yet: there is no script that
+   fetches, builds `--profile release` and names the artifact, and nothing sets
+   `#![windows_subsystem = "windows"]` in `app/src/main.rs`, so the GUI build
+   opens a console window behind it. PDFium is BSD-3-Clause and its own
+   dependencies have their notices vendored in `third_party/pdfium/licenses/`;
+   shipping an `.exe` that carries the library means shipping those texts with it,
+   which is a decision for whoever writes the packaging step — beside the `.exe`,
+   or embedded and printed by a `--licenses` flag, which is the only shape that
+   keeps the promise of one file.
 
 Full detail, including the measurements behind each, is in
 `docs/phase0-findings.md`.

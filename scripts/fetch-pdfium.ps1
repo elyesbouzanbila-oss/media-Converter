@@ -11,8 +11,10 @@
 #   .\scripts\fetch-pdfium.ps1
 #
 # The pinned version is also embedded into the final application binary via
-# include_bytes!, and extracted to a version-keyed cache directory on first run.
-# Keep $PdfiumVersion in sync with the constant in crates/pdfium-sys/build.rs.
+# include_bytes! (engine/pdf/build.rs), and extracted to a version-keyed cache
+# directory on first run (engine/pdf/src/bind.rs). Keep $PdfiumVersion in sync
+# with PDFIUM_VERSION in that file: it names the cache directory, so a mismatch
+# means the same version is fetched twice and the old library stays on disk.
 
 [CmdletBinding()]
 param(

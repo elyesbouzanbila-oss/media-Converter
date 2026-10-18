@@ -1272,6 +1272,7 @@ version = "0.1.0"
 dependencies = [
  "dconv-ir",
  "pdfium-render",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
 ]

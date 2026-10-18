@@ -12,3 +12,12 @@ dconv-ir = { workspace = true }
 pdfium-render = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+# `build.rs` decides whether this crate carries a copy of PDFium inside itself
+# and says so with a cfg; without declaring it here, every build of this crate
+# warns about an unexpected one.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(embedded_pdfium)'] }
