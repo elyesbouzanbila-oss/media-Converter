@@ -1,0 +1,25 @@
+[package]
+name = "dconv-app"
+description = "Desktop GUI front end for the docconvert engine (egui/eframe)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The product binary is `dconvert`, so it stays distinct from the engine CLI's
+# `dconv`.
+[[bin]]
+name = "dconvert"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
