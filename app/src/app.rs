@@ -72,6 +72,10 @@ impl App {
         } else {
             cc.egui_ctx.set_theme(egui::Theme::Light);
         }
+        // The palette paints the dark theme; installing it once is enough,
+        // because Context::set_theme records a preference and never resets
+        // the style underneath it (theme.rs explains why).
+        crate::theme::install(&cc.egui_ctx);
 
         log.lock().push_timed(format!(
             "engine started: worker-process pool, default {} worker(s)",

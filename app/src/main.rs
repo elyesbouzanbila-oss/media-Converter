@@ -16,6 +16,7 @@ mod app;
 mod engine;
 mod log_ring;
 mod state;
+mod theme;
 mod ui;
 
 fn main() -> eframe::Result {

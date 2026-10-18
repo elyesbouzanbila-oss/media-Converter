@@ -13,18 +13,21 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::time::Duration;
 
-// Colors derived from the theme where possible; a small fixed set for states.
+// Colors from the theme where possible; the palette (theme.rs) for states.
 fn status_color(status: &JobStatus, ui: &egui::Ui) -> egui::Color32 {
     match status {
         JobStatus::Queued => ui.visuals().weak_text_color(),
-        JobStatus::Running => egui::Color32::from_rgb(0x4f, 0x8a, 0xff),
-        JobStatus::Done => egui::Color32::from_rgb(0x2f, 0x9e, 0x64),
-        JobStatus::Failed => egui::Color32::from_rgb(0xd9, 0x4f, 0x42),
-        JobStatus::Cancelled => egui::Color32::from_rgb(0xc9, 0x8a, 0x2e),
+        JobStatus::Running => crate::theme::TEAL,
+        JobStatus::Done => crate::theme::ORANGE,
+        JobStatus::Failed => crate::theme::RED,
+        // A cancelled job reads as "dead": red drained back toward the navy,
+        // so it cannot be mistaken for a live failure (pure `RED` on the
+        // navy) and differs from the queued grey.
+        JobStatus::Cancelled => crate::theme::blend(crate::theme::RED, crate::theme::NAVY, 0.45),
     }
 }
 
-const COLOR_WARN: egui::Color32 = egui::Color32::from_rgb(0xc9, 0x8a, 0x2e);
+const COLOR_WARN: egui::Color32 = crate::theme::ORANGE;
 
 fn fmt_elapsed(d: Duration) -> String {
     let s = d.as_secs_f32();
@@ -77,10 +80,7 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
             ui.heading("dconvert");
             ui.weak("document converter");
             if !app.engine_alive() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0xd9, 0x4f, 0x42),
-                    "engine unavailable",
-                );
+                ui.colored_label(ui.visuals().error_fg_color, "engine unavailable");
             } else if app.busy() {
                 if let Some(p) = app.queue.batch_progress() {
                     ui.add(
@@ -117,7 +117,12 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
                     (counts.queued > 0 || counts.running > 0 || app.engine_in_flight() > 0)
                         && app.engine_alive();
                 if ui
-                    .add_enabled(cancellable, egui::Button::new("Cancel all"))
+                    .add_enabled(
+                        cancellable,
+                        // Danger surface, not danger text: the crimson needs
+                        // a surface to pass contrast on (theme.rs).
+                        egui::Button::new("Cancel all").fill(crate::theme::CRIMSON),
+                    )
                     .clicked()
                 {
                     app.cancel_all();
@@ -131,7 +136,15 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
                 if ui
                     .add_enabled(
                         counts.queued > 0 && app.engine_alive(),
-                        egui::Button::new(start_label),
+                        // The one call to action: the accent itself for a
+                        // surface, navy text on it for contrast rather than
+                        // the default light text, which fails on teal.
+                        egui::Button::new(
+                            egui::RichText::new(start_label)
+                                .color(crate::theme::NAVY)
+                                .strong(),
+                        )
+                        .fill(crate::theme::TEAL),
                     )
                     .clicked()
                 {
@@ -253,13 +266,11 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
             }
             ui.add_space(8.0);
             ui.weak(
-                "M0 runs the demo engine: nothing is written to disk. Files whose \
-                 name contains “fail” fail on purpose, “warn” produces warnings.",
+                "Files convert in a pool of worker processes around the real \
+                 facade. During UI review the demo engine swaps in one line — \
+                 a file whose name contains “fail” fails on purpose, “warn” \
+                 produces warnings, and nothing is written to disk.",
             );
-            ui.vertical(|ui| {
-                ui.weak("The real engine (the facade in dconv-engine) plugs in at M1");
-                ui.weak("behind the same command/event protocol.");
-            });
         });
 }
 
@@ -466,12 +477,24 @@ fn progress_cell(ui: &mut egui::Ui, job: &Job) {
 
 pub fn draw_central(app: &mut App, ui: &mut egui::Ui) {
     let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
-    let accent = egui::Color32::from_rgb(0x4f, 0x8a, 0xff);
-    let mut frame = egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 10));
+    // Theme-driven: the deep inset paints the drop surface — the old frame
+    // was transparent, and the wgpu clear colour bled through it as black —
+    // and the selection accent strokes and tints the frame while files are
+    // dragged over it.
+    let accent = ui.visuals().selection.stroke.color;
+    // The same navy as the panels, not an inset: a drop zone this tall was
+    // painted as its own dark column and read as foreign to the palette.
+    // The region is carried by the centred hint and the drag-hover accent,
+    // which used to bleed the wgpu clear colour through the transparent
+    // frame as black.
+    let base = ui.visuals().panel_fill;
+    let mut frame = egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .fill(base);
     if hovering {
-        frame = frame.stroke(egui::Stroke::new(2.5, accent)).fill(
-            egui::Color32::from_rgba_unmultiplied(0x4f, 0x8a, 0xff, 0x14),
-        );
+        frame = frame
+            .stroke(egui::Stroke::new(2.5, accent))
+            .fill(crate::theme::blend(base, accent, 0.1));
     }
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         let counts = app.counts();
@@ -594,7 +617,7 @@ fn draw_log(app: &App, ui: &mut egui::Ui) {
     }
     for line in lines {
         let color = if line.contains("FAILED") {
-            egui::Color32::from_rgb(0xd9, 0x4f, 0x42)
+            ui.visuals().error_fg_color
         } else if line.contains("WARN") {
             COLOR_WARN
         } else {
@@ -623,14 +646,17 @@ pub fn draw_status_bar(app: &mut App, ui: &mut egui::Ui) {
                 let engine = if !app.engine_alive() {
                     "engine: unavailable".to_owned()
                 } else if app.busy() {
+                    // The status bar deliberately does not name the engine
+                    // kind: production runs the worker-process pool and the
+                    // demo swap (one line in main.rs) must not lie either.
                     format!(
-                        "engine: running ({} in flight) — demo pool, {} worker(s)",
+                        "engine: running ({} in flight, {} worker(s))",
                         app.engine_in_flight(),
                         app.settings.workers_or_default()
                     )
                 } else {
                     format!(
-                        "engine: idle — demo pool (default {} worker(s))",
+                        "engine: idle ({} worker(s))",
                         app.settings.workers_or_default()
                     )
                 };
@@ -645,7 +671,7 @@ pub fn draw_status_bar(app: &mut App, ui: &mut egui::Ui) {
                     app.warnings.len()
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("dconv-app M0");
+                    ui.weak("dconv-app");
                 });
             });
         });
