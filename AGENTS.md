@@ -338,6 +338,13 @@ app/src/app.rs        the eframe App: owns state, drains events, paints
 app/src/log_ring.rs   bounded in-memory log backing the console tab
 ```
 
+How it looks: `app/src/theme.rs` paints the dark theme with a user-chosen
+five-colour palette — navy `#142537` surfaces, teal `#04BFBF` accents
+(selection, links, progress, Start), orange `#FE773D` for attention/warnings,
+red `#F24130` for failure and crimson `#A63F48` as the danger surface
+(Cancel-all); every other tone is a blend of those, and light mode keeps
+egui's stock visuals so the toggle still means something.
+
 What it does: drag & drop (folders expanded recursively, bounded), add-files and
 add-folder dialogs, a job queue table with per-job progress and control, cancel-all,
 clear-finished, a details/log/warnings tab strip, a settings side panel (target
