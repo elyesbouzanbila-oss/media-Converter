@@ -14,3 +14,7 @@
 # Scratch output from local conversions, and the harnesses' bytecode.
 /out/
 __pycache__/
+
+# The assembled release folder from scripts/package.ps1 (binaries + LICENSES) -
+# built, never committed.
+/dist/

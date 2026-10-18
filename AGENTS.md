@@ -13,11 +13,12 @@ measurements behind them.
 - The engine works: `dconv file.pdf` produces a real `.docx` at **1.28 % word
   error** on the primary test document. Everything is committed and 96 tests
   pass.
-- **It ships as one file.** `pdfium.dll` is embedded in the executable and
-  unpacked into a version-keyed cache on first run, so a build runs on a machine
-  that has never seen PDFium. Measured end to end, not argued — but it is a
-  property of a build made *after* the fetch, which cargo does not arrange by
-  itself; see [the single-file check](#checking-the-single-file-claim).
+- **The executables ship self-sufficient.** `pdfium.dll` is embedded in each one
+  and unpacked into a version-keyed cache on first run, so one file runs on a
+  machine that has never seen PDFium; `scripts/package.ps1` assembles the
+  deliverable and puts the licence texts beside it. Measured end to end, not
+  argued — but it is a property of a build made *after* the fetch, which cargo
+  does not arrange by itself; see [the single-file check](#checking-the-single-file-claim).
 - **Conversion is byte-for-byte reproducible, and that is now asserted.** Seven
   committed fixtures under `tests/fixtures/synthetic/` are converted end to end
   and checked against a committed `.docx` each, so a fresh clone can run a real
@@ -74,7 +75,8 @@ engine/
   cli/         dconv-cli       the `dconv` binary
 app/           dconv-app       the egui/eframe GUI, binary `dconvert`  (UI owner)
 spikes/        pdf-extract, typst-pdf, pdf-pool   Phase 0 throwaway experiments
-scripts/       fetch-pdfium.ps1, make_fixtures.py, compare_*.py, validate_docx.py
+scripts/       fetch-pdfium.ps1, package.ps1, make_fixtures.py, compare_*.py,
+               validate_docx.py
 docs/          phase0-findings.md   the decision record
 third_party/   pdfium/    (gitignored; fetched by script)
 tests/fixtures/synthetic/ (committed) the fixtures, each with a golden .docx
@@ -95,6 +97,8 @@ cargo build  --profile spike            # whole workspace
 cargo test   --profile spike            # whole workspace, 96 tests
 cargo build  -p dconv-cli --profile spike
 target\spike\dconv.exe --help
+
+.\scripts\package.ps1                   # dist\: both executables + LICENSES\
 ```
 
 Two release profiles, and the distinction matters for iteration speed:
@@ -140,8 +144,17 @@ before building a release.
 
 What the tests cannot assert is that the *program* still works with no library on
 disk anywhere: every bind on this machine finds the vendored copy first. (The
-bytes are asserted — that is the seven tests in `bind.rs`.) So this is a
-procedure, run when the claim matters (a release, or a change to `bind.rs`):
+bytes are asserted — that is the seven tests in `bind.rs`.) Two things cover the
+rest.
+
+`scripts/package.ps1` assembles the deliverable and refuses to finish unless each
+executable *contains* the vendored library's bytes — an ordinal search over 17 MB
+rather than a hash, because the library is inside the file and there is no second
+file to hash. That runs against the release build, which is stripped, so it is
+also what checks that stripping did not take the embed with it.
+
+The runtime claim is a procedure, run when it matters (a release, or a change to
+`bind.rs`):
 
 1. Rename `third_party/pdfium/bin/pdfium.dll` aside, and delete
    `%LOCALAPPDATA%\docconvert\pdfium\8100\` if it exists — the two ways the
@@ -617,19 +630,22 @@ owner's.
    Comparing baselines rather than bottoms is the fix; both real documents would
    have to be re-measured to re-tune the constants against the new quantity. Full
    detail in `SCRIPT_RAISE_OWN`'s comment in `engine/pdf/src/layout.rs`.
-7. **Packaging — and the notices that go with it.** The embed makes the binary
-   self-sufficient, but nothing assembles a release yet: there is no script that
-   fetches, builds `--profile release` and names the artifact, and nothing sets
-   `#![windows_subsystem = "windows"]` in `app/src/main.rs`, so the GUI build
-   opens a console window behind it. That script is also where the embed stops
-   being a hope and becomes something checked — the artifact is either several
-   megabytes bigger than a binary without it or it is not the deliverable, and
-   the procedure above is the honest test. PDFium is BSD-3-Clause and its own
-   dependencies have their notices vendored in `third_party/pdfium/licenses/`;
-   shipping an `.exe` that carries the library means shipping those texts with it,
-   which is a decision for whoever writes the packaging step — beside the `.exe`,
-   or embedded and printed by a `--licenses` flag, which is the only shape that
-   keeps the promise of one file.
+7. **What packaging still owes.** `scripts/package.ps1` assembles `dist/`: both
+   executables, each checked to contain the vendored library's bytes, and
+   `LICENSES/` beside them — the notices PDFium and its dependencies require,
+   byte-identical to the copies in `third_party/pdfium/`. The decision was files
+   beside the executables rather than texts embedded and printed by a
+   `--licenses` flag: a redistributor has to be able to pass the notices on, and
+   a folder is easier to hand on than a flag. It does mean the deliverable is a
+   folder and not one file, which is worth knowing before anyone promises "one
+   file" to somebody. Still missing: `#![windows_subsystem = "windows"]` in
+   `app/src/main.rs` (the UI owner's file), so the GUI build opens a console
+   window behind it; and notices for the Rust crates the executables link —
+   `Cargo.lock` holds 698 packages across every platform and target, and even
+   the Windows subset is too many to write out by hand. `cargo-about` is the
+   tool for collecting those properly and nothing here does it yet; the
+   `LICENSES/README.txt` this script writes says so, where a redistributor reads
+   it rather than where a maintainer does.
 
 Full detail, including the measurements behind each, is in
 `docs/phase0-findings.md`.
