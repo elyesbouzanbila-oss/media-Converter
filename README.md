@@ -204,8 +204,8 @@ flag.
 | `tests\fixtures\synthetic\` | `scripts\make_fixtures.py` | Seven committed fixtures, each with a golden `.docx`. |
 | `tests\fixtures\private\` | you | The real documents behind the fidelity numbers. Gitignored. |
 
-Settings, logs and output naming belong to the GUI; the engine writes exactly
-where it is told.
+Settings and logs belong to the GUI, as does output naming; the engine writes
+exactly where it is told.
 
 ## Testing
 
@@ -219,7 +219,7 @@ end-to-end runs over the committed fixtures:
 
 - `engine/convert/tests/golden.rs` converts all seven and compares the bytes.
 - `engine/cli/tests/pool.rs` converts every fixture serially **and** pooled and
-  compares each other and the goldens.
+  compares the two runs with each other and with the goldens.
 - `app/tests/worker_golden.rs` does the same through a real GUI worker child.
 
 Two goldens (`table-wrapped`, `columns`) deliberately pin output that is **known
