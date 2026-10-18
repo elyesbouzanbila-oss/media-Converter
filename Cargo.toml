@@ -31,8 +31,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pdfium-render = { version = "0.9.4", features = ["paragraph"] }
 
 # --- pdf writing (pure rust) ---
-# typst = "0.15.1"
-# typst-pdf = "0.15.1"
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
 
 # --- Release: this workload is pure CPU-bound compute, so LTO pays off. ---
 [profile.release]

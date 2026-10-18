@@ -1,0 +1,15 @@
+[package]
+name = "spike-typst-pdf"
+description = "Phase 0 spike B: measure embedded Typst PDF generation and font-cache reuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+typst = { workspace = true }
+typst-pdf = { workspace = true }
+typst-layout = { workspace = true }
+typst-assets = { workspace = true }
+anyhow = { workspace = true }

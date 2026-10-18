@@ -107,11 +107,12 @@ struct Report {
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || argv[0].starts_with("--") {
-        eprintln!("usage: spike-pdf-extract <file.pdf> [--dump N] [--repeat N]");
+        eprintln!("usage: spike-pdf-extract <file.pdf> [--dump N] [--repeat N] [--quiet]");
         eprintln!();
         eprintln!("  --dump N     print the first N pages of reconstructed lines");
         eprintln!("  --raw N      dump the first N raw glyphs of page 1, with codepoints");
         eprintln!("  --repeat N   run the extraction N times and report each run");
+        eprintln!("  --quiet      print one machine-readable RESULT line and nothing else");
         std::process::exit(2);
     }
 
@@ -119,6 +120,7 @@ fn main() -> Result<()> {
     let dump = flag(&argv, "--dump").unwrap_or(0);
     let raw = flag(&argv, "--raw").unwrap_or(0);
     let repeat = flag(&argv, "--repeat").unwrap_or(1).max(1);
+    let quiet = argv.iter().any(|a| a == "--quiet");
 
     let lib_dir = dll_dir();
     let lib = Pdfium::pdfium_platform_library_name_at_path(&lib_dir);
@@ -144,7 +146,7 @@ fn main() -> Result<()> {
         // Dump on the final run only, so a warm run is what gets printed.
         let this_dump = if run == repeat { dump } else { 0 };
         let report = run_once(&pdfium, &path, this_dump)?;
-        if repeat > 1 {
+        if repeat > 1 && !quiet {
             println!(
                 "  run {run}/{repeat}: load {:.1} ms, extract {:.1} ms",
                 ms(report.load),
@@ -155,11 +157,25 @@ fn main() -> Result<()> {
     }
 
     let report = last.expect("at least one run");
-    print_report(&path, &report, bind, repeat);
+    if quiet {
+        // Single machine-readable line, for the process-pool scaling driver to
+        // parse. Kept stable and space-separated so it is trivial to read back.
+        println!(
+            "RESULT pages={} glyphs={} lines={} load_ms={:.3} extract_ms={:.3}",
+            report.pages,
+            report.glyphs,
+            report.lines,
+            ms(report.load),
+            ms(report.extract)
+        );
+    } else {
+        print_report(&path, &report, bind, repeat);
+    }
     Ok(())
 }
 
-fn run_once(pdfium: &Pdfium, path: &Path, dump: usize) -> Result<Report> {    let t_load = Instant::now();
+fn run_once(pdfium: &Pdfium, path: &Path, dump: usize) -> Result<Report> {
+    let t_load = Instant::now();
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .with_context(|| format!("opening {}", path.display()))?;

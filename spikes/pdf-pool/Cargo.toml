@@ -1,0 +1,11 @@
+[package]
+name = "spike-pdf-pool"
+description = "Phase 0 spike C: measure worker-process pool scaling for PDF extraction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
