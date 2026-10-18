@@ -224,6 +224,7 @@ mod tests {
             Block::List(ListBlock {
                 ordered: false,
                 start: None,
+                numbering: Default::default(),
                 marker: None,
                 items: vec![
                     ListItem {

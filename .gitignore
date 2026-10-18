@@ -10,3 +10,7 @@
 # Local scratch: sample documents for conversion-quality testing.
 /tests/fixtures/private/
 /tmp/
+
+# Scratch output from local conversions, and the harnesses' bytecode.
+/out/
+__pycache__/

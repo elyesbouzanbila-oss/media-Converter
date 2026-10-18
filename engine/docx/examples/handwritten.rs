@@ -119,6 +119,7 @@ fn main() {
             Block::List(ListBlock {
                 ordered: false,
                 start: None,
+                numbering: Default::default(),
                 marker: None,
                 items: vec![
                     ListItem {
@@ -143,7 +144,11 @@ fn main() {
             }),
             Block::List(ListBlock {
                 ordered: true,
-                start: Some(1),
+                // Deliberately not 1, and deliberately parenthesised: this is
+                // the shape a real PDF produced, and a writer that regenerates
+                // `1.` instead loses both facts.
+                start: Some(4),
+                numbering: Numbering::Parenthesis,
                 marker: None,
                 items: vec![
                     ListItem {

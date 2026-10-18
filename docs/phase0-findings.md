@@ -327,6 +327,10 @@ redesign.
 
 ## Open questions for Phase 1
 
+> Superseded by the Phase 1 findings below, which answer most of these with
+> measurements. Kept as written, because the difference between what was
+> expected here and what actually happened is the useful part.
+
 - Reading order in multi-column and table layouts is now the dominant source of
   error, measured, not guessed: ~134 of 140 remaining token differences on the
   second real document (finding D2). Table reconstruction needs the
@@ -338,3 +342,147 @@ redesign.
   size, or against a per-page distribution, is still unresolved. On the first
   real document, H1 and H2 are both 13 pt and differ only by italic, so size
   alone will not separate them.
+
+---
+
+# Phase 1 findings — the first end-to-end conversion
+
+The pipeline runs: PDF → positioned glyphs → bands and segments → Doc IR →
+`.docx`, through `dconv`. Measured against MuPDF, reading the text back *out of
+the produced `.docx`* rather than out of our own code, so that a writer bug
+cannot hide behind the reader that fed it.
+
+| document | pages | word error rate | similarity | missing | extra |
+| --- | --- | --- | --- | --- | --- |
+| `3IRS_TP2.pdf` | 5 | **1.28 %** | 99.21 % | 1 | 1 |
+| `TP2 Admin BD 2026_2027.pdf` | 6 | **6.92 %** | 96.34 % | 3 | 3 |
+
+The word error rate is order-sensitive, and its reference is MuPDF's own block
+order, which is not guaranteed to be reading order. The missing/extra token
+counts are order-*independent*, and they are the honest measure of extraction:
+every remaining difference is now ordering rather than loss. Both documents'
+token counts now match the reference exactly.
+
+## Finding D7 — a script's raise must be bounded against the base text too
+
+An 11 pt bullet 10.94 pt below a 16 pt title was classified as a subscript of it.
+The bullet glyph was pulled into the title line, which then read `Tra•nsactions`,
+and — because the bullet was gone from its own line — that line stopped looking
+like a list item at all. One misgrouped glyph cost a title, a list, and a
+paragraph.
+
+Bounding the raise by the arriving glyph's *own* size is not enough: 10.94 pt is
+0.99 of the bullet's height, which is plausible for a script. Bounding it against
+the *base* as well rejects it, because it is 0.68 em of the 16 pt line. Both
+bounds are needed — the real `3ème` raises a 6.96 pt script 5.7 pt, which is 0.82
+of its own height but only 0.52 em of the 11.04 pt base.
+
+## Finding D8 — sorting by baseline visits a superscript before its base
+
+Grouping glyphs by baseline descending is the obvious way to walk a page, and it
+is wrong for exactly the case it most needs to get right: a raised glyph has a
+*higher* baseline, so it is seen first, opens its own band, and the full-size
+glyph it annotates can no longer join it. `2ème` consequently split into `2` and
+`ème`. Two changes fix it, and neither works alone: offer each glyph to the most
+recent existing bands before starting a new one, and re-anchor a band when a
+taller glyph arrives, because a taller glyph is the base text rather than a
+script.
+
+## Finding D9 — the size-ratio test has to be symmetric
+
+The same root cause seen from the other side. Asking whether the *arriving* glyph
+is small is not the same question as whether the two glyphs differ much in size,
+and the two answers diverge precisely when the script arrives first. The rule
+compares `min` against `max`, not the newcomer against the band.
+
+## Finding D10 — a band of nothing but spaces is not a paragraph
+
+A single 12 pt space at the top of page 2 of `TP2 Admin BD` was emitted as an
+empty heading: whitespace has no text but it does have a size, and a size above
+the body's reads as a heading. Word gaps are inferred from geometry, so a band
+with no letters in it carries no information at all. It is now dropped at the
+layout stage rather than left for the classifier to keep re-deciding about.
+
+## Finding D11 — list punctuation is information, and cheap to keep
+
+`1)` was rendered as `1.`, and a list the source interrupted and resumed restarted
+at 1. Both are visible edits to the document. The IR gained a `Numbering`
+punctuation style and the reader carries the source's own number, so a writer
+*reproduces* a list instead of inventing one.
+
+## Finding D12 — control characters are a real, small, unfixable loss
+
+`U+0002 × 1` on `3IRS_TP2.pdf`, `U+0002 × 3` on `TP2 Admin BD`, and each one sits
+exactly at a line-ending hyphen (`sont-`, `entre-`, `ci-`). The glyphs are real
+U+002D hyphens in the file; PDFium's ToUnicode mapping is what is broken, and the
+code point that arrives carries no information about the character it replaced.
+Recovering it would mean guessing, and a wrong character is invisible corruption
+where an omission is a visible gap, so the character stays dropped.
+
+What changed is that it is no longer *silent*. The reader keeps a histogram of
+discarded code points and `dconv` reports them, which turned "the hyphens are
+missing" into "exactly three code points, all `U+0002`" — the difference between
+a mystery and a known limitation.
+
+The same histogram shows `U+000A × 244` and `U+000D × 244` in one document, and
+those are *correctly* discarded: a line break in a PDF is a positioning
+operation, never a character, so one of each per line is the producer's
+arithmetic showing through.
+
+## Finding D13 — size alone over-promotes a note box to thirteen headings
+
+`TP2 Admin BD` sets a bordered note and its questions at 12 pt inside an 11 pt
+body. Size is the only signal the heading rule uses, and 12 pt clears the
+`body_size + 0.5` cutoff, so `Question :` became a level-3 heading eleven times,
+along with `Questions :`, `Connecté en Session A :`, and the tail of a wrapped
+line (`dessous.`).
+
+The document's size histogram says plainly that 12 pt is *never* a heading here —
+it appears only in that note — but the profile cannot see that, because it
+decides from a character count per size and 12 pt carries only 317 characters
+against 11 pt's 8521. A character count cannot separate "rare because it is a
+heading" from "rare because it is in a box".
+
+What would separate them is not another size threshold but a second signal, and
+the document offers an obvious one: a heading has extra space above it. The
+genuine headings sit 18–30 pt below the preceding line against a 14 pt body
+pitch, while the note's lines sit 14.5–16.5 pt apart. That is the same class of
+evidence as the bander's other rules — geometry the producer already committed to
+— and it is the natural next step. It is not in this slice.
+
+This one does not move the token counts at all: every character survives, and the
+error rate is unchanged. It is visible fidelity, not extraction, which is why it
+is worth fixing next rather than now — a heading rule is the kind of thing worth
+agreeing on before it is written, and finding D2's note that H1 and H2 may differ
+only by italic is the same open question.
+
+## Correcting the earlier reading-order question
+
+The note that table reconstruction "needs the x-segmentation stage before it can
+even be evaluated" is resolved: x-segmentation works — columns separate cleanly,
+and the simple glossary table in `TP2 Admin BD` is recovered as a real 3×2 table.
+What defeats it is **wrapped cells**. In that glossary the first column wraps to
+two lines and the second to three, so a visual line is not a row, and the band
+holding only the tail of one cell (`temps.`) has one segment where its neighbours
+have two. The region stops looking like a table and falls back to flow, which
+interleaves a wrapped cell with its neighbour.
+
+That accounts for the whole of the remaining error: of 140 differing tokens on
+the second document, 3 are the lost hyphens and 137 are this. It is a
+well-defined feature — group bands into rows by column membership, then merge a
+cell's wrapped lines — rather than an open question.
+
+## What the thin slice established
+
+- The architecture holds end to end: reader → IR → writer, with the CLI sharing
+  every line of it with the GUI.
+- `dconv --dump` prints the analysed structure, and
+  `cargo run -p dconv-pdf --example bands` prints the bands and the geometry
+  behind them. Both exist because "why did this line come out wrong?" is the
+  question that actually gets asked, and it is answerable in seconds.
+- A fidelity number is only trustworthy if the thing being measured is the file
+  a user opens. The first measurement here was wrong in a way that looked like a
+  conversion bug: the harness read text node by node and so concatenated a list
+  marker with its item across a `<w:tab/>`, which reads as `•Tester`. That is now
+  a rule about `w:tab` and `w:br`, not a guess.
+

@@ -508,16 +508,53 @@ pub struct ListItem {
     pub blocks: Vec<Block>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// How an ordered list's numbers are punctuated in the source.
+///
+/// Carried because a PDF's list numbers are literal glyphs, so the source has an
+/// opinion here and discarding it edits the document: `1)` rendered as `1.` is a
+/// visible change to every item. It is also what makes `start` usable, since the
+/// two together are exactly what a writer needs in order to *reproduce* a list's
+/// numbering instead of inventing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Numbering {
+    /// `1.`
+    #[default]
+    Period,
+    /// `1)`
+    Parenthesis,
+    /// `(1)`
+    Parenthesised,
+}
+
+impl Numbering {
+    /// Render one number in this style.
+    ///
+    /// Lives here rather than in a writer because the punctuation is a fact
+    /// about the document, not about the output format.
+    pub fn render(self, number: u64) -> String {
+        match self {
+            Numbering::Period => format!("{number}."),
+            Numbering::Parenthesis => format!("{number})"),
+            Numbering::Parenthesised => format!("({number})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ListBlock {
     #[serde(default)]
     pub ordered: bool,
     /// First number for an ordered list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<u64>,
-    /// Marker hint for unordered lists, e.g. `"•"`, `"–"`. Purely
-    /// presentational; writers may ignore it and use their own marker for the
-    /// nesting depth.
+    /// Punctuation of an ordered list's numbers.
+    #[serde(default)]
+    pub numbering: Numbering,
+    /// Marker hint, e.g. `"•"`, `"–"`. For an unordered list this is the
+    /// marker itself; for an ordered one it overrides [`Numbering`] and is used
+    /// verbatim for every item, which is what a reader that captured markers
+    /// literally should set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<String>,
     pub items: Vec<ListItem>,
@@ -602,12 +639,19 @@ impl Block {
             }
             Block::List(list) => {
                 for (idx, item) in list.items.iter().enumerate() {
-                    let marker = if list.ordered {
-                        format!("{}. ", list.start.unwrap_or(1) as usize + idx)
-                    } else {
-                        "- ".to_string()
+                    // The same rule the writers use, so that the plain-text view
+                    // cannot disagree with the file the writer emits. An explicit
+                    // marker wins; otherwise an ordered list numbers itself from
+                    // its start value in its own punctuation style.
+                    let marker = match &list.marker {
+                        Some(marker) => marker.clone(),
+                        None if list.ordered => {
+                            list.numbering.render(list.start.unwrap_or(1) + idx as u64)
+                        }
+                        None => "-".to_string(),
                     };
                     out.push_str(&marker);
+                    out.push(' ');
                     for (i, b) in item.blocks.iter().enumerate() {
                         if i > 0 {
                             out.push_str("   ");
@@ -993,6 +1037,7 @@ mod tests {
         let list = ListBlock {
             ordered: true,
             start: Some(3),
+            numbering: Numbering::Parenthesis,
             marker: None,
             items: vec![
                 ListItem {
@@ -1015,7 +1060,14 @@ mod tests {
         };
         let mut doc = Document::new();
         doc.blocks.push(Block::List(list));
-        assert_eq!(doc.plain_text(), "3. third\n4. fourth");
+        assert_eq!(doc.plain_text(), "3) third\n4) fourth");
+    }
+
+    #[test]
+    fn numbering_renders_each_punctuation_style() {
+        assert_eq!(Numbering::Period.render(7), "7.");
+        assert_eq!(Numbering::Parenthesis.render(7), "7)");
+        assert_eq!(Numbering::Parenthesised.render(7), "(7)");
     }
 
     #[test]

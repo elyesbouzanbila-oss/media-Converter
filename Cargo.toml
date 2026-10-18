@@ -9,7 +9,7 @@ resolver = "3"
 # A glob is deliberately not used for the UI directory: cargo has to resolve
 # every match into a package, so a half-created directory would break the build
 # for both of us.
-members = ["engine/*", "spikes/*"]
+members = ["engine/*", "spikes/*", "app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -41,6 +41,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # --- command line ---
 clap = { version = "4", features = ["derive"] }
+
+# --- UI (dconv-app): egui/eframe + native dialogs ---
+# `persistence` is not in eframe's default set any more; settings storage
+# depends on it.
+eframe = { version = "0.37", features = ["persistence"] }
+egui_extras = "0.37"
+rfd = "0.17"
 
 # --- containers: a .docx is a zip of XML parts ---
 zip = "9"

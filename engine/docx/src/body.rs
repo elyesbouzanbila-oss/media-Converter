@@ -176,12 +176,18 @@ fn list_block(ctx: &mut Ctx, list: &ir::ListBlock, out: &mut String, list_level:
         // which is a meaningful amount of machinery for a first pass. The
         // visible result is close enough to review, and swapping in real
         // numbering later is contained to this function.
-        let marker = if list.ordered {
-            let text = format!("{number}.");
-            number += 1;
-            text
-        } else {
-            list.marker.clone().unwrap_or_else(|| "•".to_string())
+        //
+        // An explicit marker wins for either kind of list: it is the reader
+        // saying it captured the source's own marker, which is more trustworthy
+        // than anything we could reconstruct from a start value.
+        let marker = match &list.marker {
+            Some(marker) => marker.clone(),
+            None if list.ordered => {
+                let text = list.numbering.render(number);
+                number += 1;
+                text
+            }
+            None => "•".to_string(),
         };
 
         match item.blocks.first() {
