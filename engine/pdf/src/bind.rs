@@ -295,8 +295,11 @@ mod tests {
     /// than a red one that says `run scripts/fetch-pdfium.ps1`.
     fn carried() -> &'static [u8] {
         embedded().expect(
-            "this build carries no copy of PDFium: scripts/fetch-pdfium.ps1 has not been run, \
-             or the library was removed after the build. Either way, rebuild.",
+            "this build carries no copy of PDFium. Either scripts/fetch-pdfium.ps1 has not been \
+             run, or it has been and cargo decided nothing had changed - it compares the \
+             library's timestamp against the last build's, and a file out of a tarball is older \
+             than that. Touch engine/pdf/build.rs (the fetch script does), or run `cargo clean \
+             -p dconv-pdf`, and build again.",
         )
     }
 

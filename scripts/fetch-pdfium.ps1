@@ -15,6 +15,9 @@
 # directory on first run (engine/pdf/src/bind.rs). Keep $PdfiumVersion in sync
 # with PDFIUM_VERSION in that file: it names the cache directory, so a mismatch
 # means the same version is fetched twice and the old library stays on disk.
+#
+# Fetching *after* a build is the case this script has to work for, and cargo
+# does not make that automatic - see Update-EmbedStamp below.
 
 [CmdletBinding()]
 param(
@@ -27,6 +30,34 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $dest = Join-Path $repoRoot 'third_party\pdfium'
 
+# Make the next build notice the library.
+#
+# Cargo decides whether to re-run engine/pdf/build.rs by comparing the watched
+# file's timestamp against the last build's, and `tar` restores the archive's -
+# so a library this script vendors is *older* than the build it has to
+# invalidate. The build after it then still carries no copy of PDFium, and says
+# nothing: the only symptom is an executable that wants a DLL beside it. (This
+# was measured, not deduced: a build made with no library, followed by one made
+# with a thirty-day-old copy in place, reports "Fresh dconv-pdf".)
+#
+# Both lines exist because they fail differently. Setting the library's own
+# timestamp makes it newer than any build that came before, which is what the
+# watch on it asks for. Touching build.rs dirties the crate as a source change,
+# which cargo cannot miss however it reasons about a path that did not exist the
+# last time it looked. Neither is expensive; the failure is silent, so it is
+# worth both.
+function Update-EmbedStamp {
+    $library = Join-Path $dest 'bin\pdfium.dll'
+    if (Test-Path $library) {
+        (Get-Item $library).LastWriteTime = Get-Date
+    }
+
+    $buildScript = Join-Path $repoRoot 'engine\pdf\build.rs'
+    if (Test-Path $buildScript) {
+        (Get-Item $buildScript).LastWriteTime = Get-Date
+    }
+}
+
 if ($PdfiumVersion -ne '8100') {
     Write-Warning "pdfium-render 0.9.4 generates bindings for the chromium/7881 API."
     Write-Warning "Versions newer than that are a superset and safe; older ones are not."
@@ -36,7 +67,9 @@ $versionStamp = Join-Path $dest 'VERSION'
 if ((Test-Path $versionStamp) -and -not $Force) {
     $existing = (Get-Content $versionStamp -Raw).Trim()
     if ($existing -eq $PdfiumVersion) {
+        Update-EmbedStamp
         Write-Host "PDFium $PdfiumVersion already present at $dest" -ForegroundColor Green
+        Write-Host "  (engine/pdf/build.rs touched, so the next build embeds it)" -ForegroundColor Green
         return
     }
     Write-Host "PDFium version changed ($existing -> $PdfiumVersion), refetching" -ForegroundColor Yellow
@@ -73,5 +106,9 @@ if ($missing) {
 
 Set-Content -Path $versionStamp -Value $PdfiumVersion
 
+# Last, so the timestamps this script leaves behind are the newest thing it did.
+Update-EmbedStamp
+
 $dll = Get-Item (Join-Path $dest 'bin\pdfium.dll')
 Write-Host ("PDFium {0} ready: {1:N0} bytes" -f $PdfiumVersion, $dll.Length) -ForegroundColor Green
+Write-Host "  engine/pdf/build.rs touched, so the next build embeds it" -ForegroundColor Green

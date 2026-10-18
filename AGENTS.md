@@ -15,8 +15,9 @@ measurements behind them.
   pass.
 - **It ships as one file.** `pdfium.dll` is embedded in the executable and
   unpacked into a version-keyed cache on first run, so a build runs on a machine
-  that has never seen PDFium. Measured end to end, not argued: see
-  [the single-file check](#checking-the-single-file-claim).
+  that has never seen PDFium. Measured end to end, not argued — but it is a
+  property of a build made *after* the fetch, which cargo does not arrange by
+  itself; see [the single-file check](#checking-the-single-file-claim).
 - **Conversion is byte-for-byte reproducible, and that is now asserted.** Seven
   committed fixtures under `tests/fixtures/synthetic/` are converted end to end
   and checked against a committed `.docx` each, so a fresh clone can run a real
@@ -120,14 +121,27 @@ ones are not.
 **Order matters for the deliverable.** The fetch has to happen before the build
 that ships, because `engine/pdf/build.rs` embeds the vendored library only if it
 is there when the crate is compiled; a tree built without it still compiles, but
-the binary carries nothing and will need a `pdfium.dll` next to it. The build
-script watches the file, so a fetch followed by a build always picks it up.
+the binary carries nothing and will need a `pdfium.dll` next to it.
+
+The order is not enforced by cargo, and the case worth knowing about is a fetch
+made *after* a build. Cargo decides whether to re-run a build script by comparing
+the watched file's timestamp against the last build's, and `tar` restores the
+archive's timestamps — so a library the fetch script has just vendored is *older*
+than the build it has to invalidate, and the build after it still carries nothing.
+Silently. Two things catch it, both measured rather than assumed: the fetch script
+touches `engine/pdf/build.rs` and the library itself, dirtying the crate as a
+source change cargo cannot miss; and `what_ships_is_the_library_every_test_binds_to`
+fails, with the fix in the message, when the vendored library is on disk while
+this build carries no copy of it. Vendoring PDFium by hand is the one path that
+does neither — touch `engine/pdf/build.rs` or run `cargo clean -p dconv-pdf`
+before building a release.
 
 ### Checking the single-file claim
 
-The embed cannot be asserted in the test suite, because every bind on this machine
-would find the vendored library first. So it is a procedure, run when the claim
-matters (a release, or a change to `bind.rs`):
+What the tests cannot assert is that the *program* still works with no library on
+disk anywhere: every bind on this machine finds the vendored copy first. (The
+bytes are asserted — that is the seven tests in `bind.rs`.) So this is a
+procedure, run when the claim matters (a release, or a change to `bind.rs`):
 
 1. Rename `third_party/pdfium/bin/pdfium.dll` aside, and delete
    `%LOCALAPPDATA%\docconvert\pdfium\8100\` if it exists — the two ways the
@@ -607,7 +621,10 @@ owner's.
    self-sufficient, but nothing assembles a release yet: there is no script that
    fetches, builds `--profile release` and names the artifact, and nothing sets
    `#![windows_subsystem = "windows"]` in `app/src/main.rs`, so the GUI build
-   opens a console window behind it. PDFium is BSD-3-Clause and its own
+   opens a console window behind it. That script is also where the embed stops
+   being a hope and becomes something checked — the artifact is either several
+   megabytes bigger than a binary without it or it is not the deliverable, and
+   the procedure above is the honest test. PDFium is BSD-3-Clause and its own
    dependencies have their notices vendored in `third_party/pdfium/licenses/`;
    shipping an `.exe` that carries the library means shipping those texts with it,
    which is a decision for whoever writes the packaging step — beside the `.exe`,
