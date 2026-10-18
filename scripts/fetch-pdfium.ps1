@@ -30,6 +30,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $dest = Join-Path $repoRoot 'third_party\pdfium'
 
+# The tarball while it is being unpacked, and the stamp saying which version is
+# unpacked. Ignored by .gitignore, and deliberately not the tarball's own VERSION
+# file: that one is committed along with the licence texts, and overwriting it
+# turns up as a modified file in every working tree that has run this script.
+$cache = Join-Path $dest '.cache'
+
 # Make the next build notice the library.
 #
 # Cargo decides whether to re-run engine/pdf/build.rs by comparing the watched
@@ -58,48 +64,69 @@ function Update-EmbedStamp {
     }
 }
 
-if ($PdfiumVersion -ne '8100') {
-    Write-Warning "pdfium-render 0.9.4 generates bindings for the chromium/7881 API."
-    Write-Warning "Versions newer than that are a superset and safe; older ones are not."
-}
-
-$versionStamp = Join-Path $dest 'VERSION'
-if ((Test-Path $versionStamp) -and -not $Force) {
-    $existing = (Get-Content $versionStamp -Raw).Trim()
-    if ($existing -eq $PdfiumVersion) {
-        Update-EmbedStamp
-        Write-Host "PDFium $PdfiumVersion already present at $dest" -ForegroundColor Green
-        Write-Host "  (engine/pdf/build.rs touched, so the next build embeds it)" -ForegroundColor Green
-        return
-    }
-    Write-Host "PDFium version changed ($existing -> $PdfiumVersion), refetching" -ForegroundColor Yellow
-}
-
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-# The tag contains a slash, which must be percent-encoded in the URL path.
-$tag = [System.Uri]::EscapeDataString("chromium/$PdfiumVersion")
-$asset = 'pdfium-win-x64.tgz'
-$url = "https://github.com/bblanchon/pdfium-binaries/releases/download/$tag/$asset"
-
-$tgz = Join-Path $dest $asset
-Write-Host "Downloading $url"
-Invoke-WebRequest -Uri $url -OutFile $tgz -Headers @{ 'User-Agent' = 'docconvert-build' }
-
-Write-Host "Extracting to $dest"
-tar -xzf $tgz -C $dest
-if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
-Remove-Item $tgz -Force
-
-# Sanity-check the pieces we actually depend on, so a silent upstream layout
-# change fails here rather than as a confusing linker or runtime error later.
+# The pieces the rest of the project needs to be present after an unpack. Used
+# both after extracting and before trusting the stamp, so a stamp cannot claim a
+# library that is not there - the embed and the runtime search both trust the
+# directory it describes.
 $required = @(
     'bin\pdfium.dll',
     'lib\pdfium.dll.lib',
     'include\fpdfview.h',
     'include\fpdf_text.h'
 )
-$missing = $required | Where-Object { -not (Test-Path (Join-Path $dest $_)) }
+
+function Get-MissingFile {
+    $required | Where-Object { -not (Test-Path (Join-Path $dest $_)) }
+}
+
+if ($PdfiumVersion -ne '8100') {
+    Write-Warning "pdfium-render 0.9.4 generates bindings for the chromium/7881 API."
+    Write-Warning "Versions newer than that are a superset and safe; older ones are not."
+}
+
+$versionStamp = Join-Path $cache 'VERSION'
+if ((Test-Path $versionStamp) -and -not $Force) {
+    $existing = (Get-Content $versionStamp -Raw).Trim()
+    $missing = Get-MissingFile
+    if ($existing -ne $PdfiumVersion) {
+        Write-Host "PDFium version changed ($existing -> $PdfiumVersion), refetching" -ForegroundColor Yellow
+    }
+    elseif ($missing) {
+        Write-Host "PDFium $PdfiumVersion is stamped as fetched, but $($missing -join ', ') is missing - refetching" -ForegroundColor Yellow
+    }
+    else {
+        Update-EmbedStamp
+        Write-Host "PDFium $PdfiumVersion already present at $dest" -ForegroundColor Green
+        Write-Host "  (engine/pdf/build.rs touched, so the next build embeds it)" -ForegroundColor Green
+        return
+    }
+}
+
+New-Item -ItemType Directory -Force -Path $cache | Out-Null
+
+# The tag contains a slash, which must be percent-encoded in the URL path.
+$tag = [System.Uri]::EscapeDataString("chromium/$PdfiumVersion")
+$asset = 'pdfium-win-x64.tgz'
+$url = "https://github.com/bblanchon/pdfium-binaries/releases/download/$tag/$asset"
+
+$tgz = Join-Path $cache $asset
+Write-Host "Downloading $url"
+try {
+    Invoke-WebRequest -Uri $url -OutFile $tgz -Headers @{ 'User-Agent' = 'docconvert-build' }
+
+    Write-Host "Extracting to $dest"
+    tar -xzf $tgz -C $dest
+    if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+}
+finally {
+    # In .cache/ so that a failed download leaves nothing git can see, and
+    # removed either way so thirty megabytes do not sit there afterwards.
+    Remove-Item $tgz -Force -ErrorAction SilentlyContinue
+}
+
+# A silent upstream layout change fails here rather than as a confusing linker
+# or runtime error later.
+$missing = Get-MissingFile
 if ($missing) {
     throw "PDFium package is missing expected files: $($missing -join ', ')"
 }
