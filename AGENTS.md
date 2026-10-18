@@ -11,7 +11,7 @@ measurements behind them.
 - **Two owners, two directories.** The engine lives in `engine/`, the GUI lives in
   `app/`. Never edit across that line.
 - The engine works: `dconv file.pdf` produces a real `.docx` at **1.28 % word
-  error** on the primary test document. Everything is committed and 97 tests
+  error** on the primary test document. Everything is committed and 100 tests
   pass.
 - **The executables ship self-sufficient.** `pdfium.dll` is embedded in each one
   and unpacked into a version-keyed cache on first run, so one file runs on a
@@ -98,7 +98,7 @@ findings are what survived.
 
 ```powershell
 cargo build  --profile spike            # whole workspace
-cargo test   --profile spike            # whole workspace, 97 tests
+cargo test   --profile spike            # whole workspace, 100 tests
 cargo build  -p dconv-cli --profile spike
 target\spike\dconv.exe --help
 
@@ -481,7 +481,9 @@ rather than inferred, and each one targets a rule that has a finding behind it.
 `cargo test -p dconv-engine --profile spike` converts all seven and compares the
 bytes with `tests/fixtures/synthetic/<name>.golden.docx`. Two of them
 (`table-wrapped`, `columns`) pin output that is **known to be wrong**, on purpose:
-the day either is fixed, it shows up as a diff rather than as a surprise. Re-bless
+the day either is fixed, it shows up as a diff rather than as a surprise.
+`table-wrapped`'s diff got smaller — the wrapped right cell now merges into its
+row — and what it still pins is explained in gap 2. Re-bless
 a deliberate change with `$env:DCONV_BLESS = "1"`, then read
 `git diff tests/fixtures/synthetic` before committing — a blessing nobody read is
 a test that has quietly stopped testing anything.
@@ -586,7 +588,7 @@ GUI shell with its real engine (worker-process pool around the facade).
 landed when; this file deliberately names no commit hashes, because a hash in a
 document goes stale the moment anyone commits.
 
-**Tests:** 97 — `dconv-ir` 17, `dconv-pdf` 30 (23 geometry, plus the seven bind
+**Tests:** 100 — `dconv-ir` 17, `dconv-pdf` 33 (26 geometry, plus the seven bind
 tests that pin what is embedded and how it is unpacked), `dconv-docx` 12,
 `dconv-engine` 9 (eight unit plus the end-to-end golden test), `dconv-cli` 9
 (seven unit, plus two end-to-end pool runs that compare a pooled run with a serial
@@ -598,30 +600,42 @@ owner's.
 
 **Known gaps, in the order they are worth doing:**
 
-1. **Wrapped table cells** — 137 of the 140 remaining differing tokens on the
-   second document. Columns separate cleanly and simple tables are recovered as
-   real Word tables; what defeats it is a cell that wraps, because then a visual
-   line is not a row and the band holding one cell's tail has fewer segments than
-   its neighbours, so the region stops looking like a table and falls back to flow.
-   The fix is well-defined: group bands into rows by column membership, then merge
-   a cell's wrapped lines.
-2. **Heading inference** — a 12 pt note box in an 11 pt document becomes thirteen
+1. **Multi-column reading order** — the ~140 differing tokens on the second
+   document, and the first thing worth doing next. The diagnosis in this file
+   used to be wrong: they are not lost to wrapped table cells. Fixing that shape
+   on page 1's ACID glossary (one 5×2 table whose tail bands merge into their
+   cells, where the old classifier left a 3-row table plus four stray paragraphs)
+   moved **zero** tokens, because the old code happened to emit those bands in
+   reading order anyway. They are lost to reading *across* the columns instead of
+   down each one: page 2's term/definition glossary, page 3's script list beside
+   the account table, and pages 4-6's "Session A / Session B" layouts all
+   interleave. MuPDF reads page 3 as the whole left list and then the table,
+   which is the model to match. The fix is to split a page into vertical strips
+   at an x-interval no segment's ink crosses, when at least two bands straddle it
+   *and* both sides carry a real share of the content width — the second test is
+   what rejects the table's own internal gutters (measured at [501.20, 521.77]).
+   `Region::Columns` (the two-column page) stays as it is; this is a different
+   split from that one. `tests/fixtures/synthetic/columns.pdf` pins the current,
+   wrong behaviour, so the day it changes is a deliberate diff.
+2. **A row whose every cell wraps** — the residual of the wrapped-cell fix, and
+   what `table-wrapped.pdf`'s golden still pins as wrong on purpose. A band whose
+   cells are a *strict subset* of the previous band's merges into that row (that
+   is what recovers the real glossary), but when every cell of a row wraps, the
+   second line fills exactly the same columns as the first and with no ruling
+   lines read there is nothing geometric left to tell it from a second row.
+   Reading the rulings is the fix; until then the fixture's first row is pinned
+   as `Connecté en` / `session` on two rows.
+3. **Heading inference** — a 12 pt note box in an 11 pt document becomes thirteen
    spurious `H3`s (`Question :`). Costs **zero** tokens; it is visible fidelity
    only. Size alone cannot fix it. The document offers a second signal: genuine
    headings sit 18–30 pt below the preceding line against a 14 pt body pitch,
    while the note's lines sit 14.5–16.5 pt apart. This is finding D13.
-3. **An ETA in the GUI's top bar**, computable from the per-page progress rate
+4. **An ETA in the GUI's top bar**, computable from the per-page progress rate
    the worker pool already reports. The worker pool, per-page live progress,
    mid-batch cancel, the capability delegation and the GUI-vs-CLI golden
    comparison are all in the adapter and its tests now.
-4. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
+5. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
    when the closed `match` in the facade becomes a real registry.
-5. **Multi-column reading order.** `tests/fixtures/synthetic/columns.pdf` pins the
-   current behaviour, which is wrong: text is read *across* the columns rather than
-   down each one, so a sentence from the left column has the right column's opening
-   line spliced into it, and the rows that do align are taken for a table. No
-   document here has needed it, which is why it is this far down — but the fixture
-   makes the day one does a deliberate diff rather than a surprise.
 6. **The superscript bound tightens as the script gets smaller.** The bander
    measures a script's raise between loose box *bottoms*, and a smaller glyph has a
    shallower box, so the difference in descent is added to the offset it compares

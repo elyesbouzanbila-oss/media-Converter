@@ -460,17 +460,28 @@ only by italic is the same open question.
 
 The note that table reconstruction "needs the x-segmentation stage before it can
 even be evaluated" is resolved: x-segmentation works — columns separate cleanly,
-and the simple glossary table in `TP2 Admin BD` is recovered as a real 3×2 table.
-What defeats it is **wrapped cells**. In that glossary the first column wraps to
-two lines and the second to three, so a visual line is not a row, and the band
-holding only the tail of one cell (`temps.`) has one segment where its neighbours
-have two. The region stops looking like a table and falls back to flow, which
-interleaves a wrapped cell with its neighbour.
+and the glossary tables in `TP2 Admin BD` are recovered as real tables. What
+defeated the first classifier was **wrapped cells**. In that glossary the first
+column wraps to two lines and the second to three, so a visual line is not a
+row, and the band holding only the tail of one cell (`temps.`) has one segment
+where its neighbours have two. The region stopped looking like a table and fell
+back to flow, which interleaves a wrapped cell with its neighbour.
 
-That accounts for the whole of the remaining error: of 140 differing tokens on
-the second document, 3 are the lost hyphens and 137 are this. It is a
-well-defined feature — group bands into rows by column membership, then merge a
-cell's wrapped lines — rather than an open question.
+That is fixed: the region now grows by column membership, keeps only the columns
+two or more bands repeat, and merges a band whose cells are a strict subset of
+the previous band's into that row — so page 1's ACID glossary is one 5×2 table
+with its wrapped definitions merged, where the old classifier left a 3-row table
+plus four stray paragraphs.
+
+What this section got wrong was the *cost*. Fixing it moved **zero** tokens:
+6.92 % before and after, the same 140. The old code happened to emit the tail
+bands in reading order anyway, so "of 140 differing tokens ... 137 are this" was
+wrong. They are lost to reading *across* the columns instead of down each one:
+page 2's term/definition glossary, page 3's script list beside the account
+table, and pages 4–6's "Session A / Session B" layouts. MuPDF's own block order
+for page 3 (the whole left list, then the table) is the model to match, which
+makes multi-column reading order the next thing worth doing rather than a low
+priority. The gap list in `AGENTS.md` says so.
 
 ## What the thin slice established
 

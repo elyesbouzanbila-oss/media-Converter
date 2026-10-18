@@ -31,7 +31,7 @@ use crate::layout::{Band, Run, Segment};
 const HEADING_MAX_CHARS: usize = 90;
 
 /// How far a segment's left edge may drift and still count as the same table
-/// column, as a fraction of the row's largest glyph.
+/// column, as a fraction of the run's largest glyph.
 const COLUMN_TOLERANCE_EM: f32 = 0.9;
 
 /// Fewer aligned rows than this is not a table. Two lines that happen to line up
@@ -224,33 +224,61 @@ enum Region {
 /// the only thing separating a table from a two-column page is how much of the
 /// page the aligned span covers. A table is part of a page; a column layout is
 /// all of it.
+///
+/// What makes a real table awkward is that a cell may wrap: the row's tallest
+/// cell then continues on a band of its own, and that band carries fewer
+/// segments than the rows around it. A shape test ("same number of segments,
+/// same left edges") stops at the first wrapped cell, which is how
+/// `TP2 Admin BD 2026_2027.pdf` loses its ACID glossary. The run is grown by
+/// *membership* instead — every segment has to sit on one of the run's columns —
+/// and only the columns two bands agree on are trusted.
 fn classify_region(bands: &[Band], start: usize, page: &ir::PageSetup) -> Region {
     let first = &bands[start].segments;
     if first.len() < 2 {
         return Region::Flow;
     }
 
-    let columns: Vec<f32> = first.iter().map(|segment| segment.left).collect();
-    let largest = first.iter().map(|s| s.size).fold(0.0f32, f32::max);
-    let tolerance = largest * COLUMN_TOLERANCE_EM;
-
-    let mut end = start;
-    while end < bands.len() {
-        let segments = &bands[end].segments;
-        if segments.len() != columns.len() {
-            break;
+    // Grow first, then keep only the columns that repeat. A column carrying a
+    // single band is not structure: it is two runs that happen to share an x,
+    // which is what a line of the list beside a table looks like (measured on
+    // page 3 of `TP2 Admin BD 2026_2027.pdf`, where the list's first two lines
+    // and the table's first two rows share columns 60.62 and 521.77 and would
+    // otherwise read as a table of their own). Pruning can cut the run short,
+    // so it repeats until it settles.
+    let mut end = grow_run(bands, start);
+    let columns = loop {
+        let columns = repeated_columns(bands, start, end);
+        if columns.len() < 2 {
+            return Region::Flow;
         }
-        let aligned = segments
-            .iter()
-            .zip(&columns)
-            .all(|(segment, column)| (segment.left - column).abs() <= tolerance);
-        if !aligned {
-            break;
-        }
-        end += 1;
-    }
 
-    if end - start < MIN_TABLE_ROWS {
+        let tolerance = run_tolerance(&bands[start..end]);
+        let strays = (start..end).find(|index| {
+            bands[*index].segments.iter().any(|segment| {
+                !columns
+                    .iter()
+                    .any(|column| (segment.left - column).abs() <= tolerance)
+            })
+        });
+
+        match strays {
+            None => break columns,
+            Some(index) if index == start => return Region::Flow,
+            Some(index) => end = index,
+        }
+    };
+
+    // Rows, not bands: a wrapped cell adds a band to a row that already exists.
+    let tolerance = run_tolerance(&bands[start..end]);
+    let rows = (start..end)
+        .filter(|index| {
+            match_columns(&bands[*index].segments, &columns, tolerance)
+                .iter()
+                .any(|column| *column == Some(0))
+        })
+        .count();
+
+    if rows < MIN_TABLE_ROWS {
         return Region::Flow;
     }
 
@@ -263,6 +291,116 @@ fn classify_region(bands: &[Band], start: usize, page: &ir::PageSetup) -> Region
     }
 
     Region::Table { end, columns }
+}
+
+/// The column each segment sits on, or `None` where one sits on no column.
+fn match_columns(segments: &[Segment], columns: &[f32], tolerance: f32) -> Vec<Option<usize>> {
+    segments
+        .iter()
+        .map(|segment| {
+            columns
+                .iter()
+                .position(|column| (segment.left - column).abs() <= tolerance)
+        })
+        .collect()
+}
+
+/// The drift a column may absorb: part of the largest glyph in the run.
+fn run_tolerance(bands: &[Band]) -> f32 {
+    bands
+        .iter()
+        .flat_map(|band| band.segments.iter())
+        .map(|segment| segment.size)
+        .fold(0.0f32, f32::max)
+        * COLUMN_TOLERANCE_EM
+}
+
+/// The columns a run of bands genuinely repeats: only a left edge that two or
+/// more bands agree on.
+fn repeated_columns(bands: &[Band], start: usize, end: usize) -> Vec<f32> {
+    let tolerance = run_tolerance(&bands[start..end]);
+    let mut clusters: Vec<(f32, usize)> = Vec::new();
+
+    for band in &bands[start..end] {
+        let mut seen: Vec<usize> = Vec::new();
+        for segment in &band.segments {
+            let index = clusters
+                .iter()
+                .position(|(left, _)| (segment.left - left).abs() <= tolerance)
+                .unwrap_or_else(|| {
+                    clusters.push((segment.left, 0));
+                    clusters.len() - 1
+                });
+            // One band fills a column once, however many segments land on it.
+            if !seen.contains(&index) {
+                seen.push(index);
+                clusters[index].1 += 1;
+            }
+        }
+    }
+
+    let mut columns: Vec<f32> = clusters
+        .into_iter()
+        .filter(|(_, bands_seen)| *bands_seen >= 2)
+        .map(|(left, _)| left)
+        .collect();
+    columns.sort_by(|a, b| a.total_cmp(b));
+    columns
+}
+
+/// How far the run that begins at `start` reaches: the longest band sequence in
+/// which every segment sits on a column the sequence already has, or brings a
+/// column of its own while filling at least two known ones.
+///
+/// The second case is a header cell merged with the one beside it: its left edge
+/// is on the first column and its text runs over the second, so the column it
+/// covers is one no earlier band names. Requiring it to fill two known columns
+/// at the same time is what keeps an ordinary sentence from inventing columns.
+fn grow_run(bands: &[Band], start: usize) -> usize {
+    let mut columns: Vec<f32> = bands[start].segments.iter().map(|s| s.left).collect();
+    columns.sort_by(|a, b| a.total_cmp(b));
+
+    let mut end = start + 1;
+    while end < bands.len() {
+        let segments = &bands[end].segments;
+        if segments.is_empty() {
+            break;
+        }
+
+        let tolerance = run_tolerance(&bands[start..=end]);
+        let mut matched = match_columns(segments, &columns, tolerance);
+        let known = matched.iter().filter(|column| column.is_some()).count();
+
+        if known < segments.len() {
+            if known < 2 {
+                break;
+            }
+            for segment in segments {
+                if !columns.iter().any(|column| (segment.left - column).abs() <= tolerance)
+                {
+                    columns.push(segment.left);
+                }
+            }
+            columns.sort_by(|a, b| a.total_cmp(b));
+            matched = match_columns(segments, &columns, tolerance);
+        }
+
+        // A lone run on the first column is where a table meets the prose below
+        // it: a paragraph's first line starts at the table's left column, and
+        // nothing on the line itself says whether it belongs to the table.
+        // Ending the run there is the conservative reading, and it is what
+        // keeps a table flush with the text margin from swallowing the
+        // paragraphs that follow it - and a two-column layout, whose columns
+        // merge into one run wherever the left column's text reaches the right
+        // one's, from reading as a table of one-column rows.
+        if segments.len() == 1 && matched[0] == Some(0) {
+            break;
+        }
+
+        end += 1;
+    }
+
+    end
 }
 
 /// Emit a multi-column region in reading order: down each column in turn.
@@ -603,24 +741,57 @@ fn strip_prefix(inlines: &[Inline], chars: usize) -> Vec<Inline> {
     out
 }
 
+/// Build a table from a run of bands that share columns.
+///
+/// Rows are grouped by column membership rather than one band per row, because a
+/// wrapped cell puts a row on two bands: `cohérent.` sits alone on the line below
+/// `Cohérence`, filling one column where the rest of the row fills two. A band
+/// whose cells are a strict subset of the previous band's can only be such a
+/// tail — no table row begins part-way across — so it continues the cell above
+/// it, and the wrapped break becomes a space, exactly as a soft line break does
+/// in a paragraph.
 fn build_table(bands: &[Band], start: usize, end: usize, columns: &[f32]) -> Block {
-    let mut rows: Vec<TableRow> = Vec::new();
+    let tolerance = run_tolerance(&bands[start..end]);
+    let mut grouped: Vec<Vec<Vec<Inline>>> = Vec::new();
+    let mut previous: Vec<usize> = Vec::new();
 
     for band in &bands[start..end] {
-        let cells: Vec<TableCell> = band
-            .segments
-            .iter()
-            .map(|segment| TableCell {
+        let matched = match_columns(&band.segments, columns, tolerance);
+        let filled: Vec<usize> = matched.iter().flatten().copied().collect();
+
+        let wrapped = !grouped.is_empty()
+            && filled.len() < previous.len()
+            && filled.iter().all(|column| previous.contains(column));
+
+        if !wrapped {
+            grouped.push(vec![Vec::new(); columns.len()]);
+        }
+        previous = filled;
+
+        let row = grouped.last_mut().expect("a row exists");
+        for (segment, column) in band.segments.iter().zip(&matched) {
+            let Some(column) = column else { continue };
+            let cell = &mut row[*column];
+            if !cell.is_empty() {
+                cell.push(Inline::text(" "));
+            }
+            cell.extend(segment_inlines(segment));
+        }
+    }
+
+    let mut rows: Vec<TableRow> = grouped
+        .into_iter()
+        .map(|cells| {
+            TableRow::new(cells.into_iter().map(|content| TableCell {
                 blocks: vec![Block::Paragraph {
-                    content: segment_inlines(segment),
+                    content,
                     align: Align::Start,
                     style: None,
                 }],
                 ..Default::default()
-            })
-            .collect();
-        rows.push(TableRow::new(cells));
-    }
+            }))
+        })
+        .collect();
 
     // A first row that is entirely bold is a header. Everything else has to be
     // inferred from ruling lines, which are not read yet.
@@ -921,5 +1092,111 @@ mod tests {
         let left = text.find("colonne de gauche").expect("left column present");
         let right = text.find("colonne de droite").expect("right column present");
         assert!(left < right, "left column must come first:\n{text}");
+    }
+
+    #[test]
+    fn a_wrapped_definition_merges_back_into_its_cell() {
+        // The ACID glossary of `TP2 Admin BD 2026_2027.pdf` page 1, at its
+        // measured positions. Every row but one is two segments; the row whose
+        // definition wraps contributes a band that fills only the second
+        // column. The old shape test stopped the table there and left four
+        // stray paragraphs behind, so the tail band is the whole point.
+        let rows: &[(f32, &str, &str, bool)] = &[
+            (600.65, "Propriété", "Description", true),
+            (580.85, "Atomicité", "La transaction s'exécute entièrement ou pas du tout.", false),
+            (
+                560.85,
+                "Cohérence",
+                "La transaction fait passer la base d'un état cohérent à un autre état",
+                false,
+            ),
+            (527.42, "Isolation", "Les transactions concurrentes ne doivent pas s'influencer.", false),
+        ];
+
+        let mut glyphs = Vec::new();
+        for (bottom, left, right, bold) in rows.iter().copied() {
+            glyphs.extend(line(left, 11.0, bottom, 76.62, bold));
+            glyphs.extend(line(right, 11.0, bottom, 186.65, bold));
+        }
+        // The tail of the second definition, on a band of its own.
+        glyphs.extend(line("cohérent.", 11.0, 547.43, 186.65, false));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &profile, &page());
+
+        assert_eq!(blocks.len(), 1, "{blocks:#?}");
+        let Block::Table(table) = &blocks[0] else {
+            panic!("expected one table, got {blocks:#?}");
+        };
+        assert_eq!(table.rows.len(), 4, "{table:#?}");
+        assert_eq!(table.column_count(), 2);
+
+        let Block::Paragraph { content, .. } = &table.rows[2].cells[1].blocks[0] else {
+            panic!("expected a cell paragraph");
+        };
+        assert_eq!(
+            ir::inlines_to_plain_text(content),
+            "La transaction fait passer la base d'un état cohérent à un autre état cohérent."
+        );
+    }
+
+    #[test]
+    fn a_list_line_beside_a_table_row_is_not_a_table() {
+        // Page 3 of the same document, at its measured positions: the script
+        // list on the left and the account table on the right share two
+        // columns (60.62 and 521.77) and two consecutive bands, which is all
+        // the old rule needed. Only the columns the rest of the run does not
+        // repeat - the table's own first and second, each filled once - tell
+        // the two apart.
+        let mut glyphs = Vec::new();
+        glyphs.extend(line("Supprime la table Compte si elle existe déjà", 11.0, 730.0, 60.62, false));
+        glyphs.extend(line("Numcpte Titulaire", 11.0, 730.0, 372.72, true));
+        glyphs.extend(line("Solde", 11.0, 730.0, 521.77, true));
+        glyphs.extend(line("Crée la table Compte avec les colonnes numcpte", 11.0, 714.0, 60.62, false));
+        glyphs.extend(line("Ali BEN SALAH", 11.0, 714.0, 429.33, false));
+        glyphs.extend(line("1000", 11.0, 714.0, 521.77, false));
+        glyphs.extend(line("(numérique sur 5 chiffres, clé primaire)", 11.0, 702.0, 78.62, false));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &profile, &page());
+
+        assert!(
+            !blocks.iter().any(|b| matches!(b, Block::Table(_))),
+            "two bands that share an x are not a table: {blocks:#?}"
+        );
+    }
+
+    #[test]
+    fn a_two_column_layout_is_not_a_table() {
+        // Page 2 of the same document: a glossary laid out as a term column
+        // and a definition column, whose texts touch wherever the left column
+        // reaches the right one's start. The merged runs fill the first column
+        // and look like wrapped rows; what separates them from a table is that
+        // the second column's x drifts with the left column's length.
+        let mut glyphs = Vec::new();
+        let merged = [
+            (741.67, "Lecture non répétable Une transaction relit une même ligne et obtient une valeur"),
+            (728.28, "(Non-Repeatable Read) différente car une autre transaction l'a modifiée et validée entre"),
+            (661.45, "Mise à jour perdue (Lost Deux transactions lisent puis écrivent la même donnée ; la"),
+        ];
+        for (bottom, text) in merged {
+            glyphs.extend(line(text, 11.0, bottom, 76.62, false));
+        }
+        glyphs.extend(line("temps.", 11.0, 714.87, 206.67, false));
+        glyphs.extend(line("Lecture", 11.0, 694.87, 76.62, true));
+        glyphs.extend(line("fantôme Une transaction ré-exécute une requête avec condition (WHERE) et", 11.0, 694.87, 155.79, false));
+        glyphs.extend(line("(Phantom Read)", 11.0, 681.47, 76.62, true));
+        glyphs.extend(line("obtient un ensemble de lignes différent.", 11.0, 681.47, 206.67, false));
+        glyphs.extend(line("Update)", 11.0, 648.05, 76.62, true));
+        glyphs.extend(line("seconde écriture écrase la première sans en tenir compte.", 11.0, 648.05, 206.67, false));
+        glyphs.extend(line("Rappel : la lecture sale n'est jamais possible sous Oracle.", 11.0, 620.45, 42.62, false));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &profile, &page());
+
+        assert!(
+            !blocks.iter().any(|b| matches!(b, Block::Table(_))),
+            "a two-column layout must not read as a table: {blocks:#?}"
+        );
     }
 }

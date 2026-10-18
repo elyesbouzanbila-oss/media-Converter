@@ -165,17 +165,23 @@ def table() -> None:
 
 
 def table_wrapped() -> None:
-    """The glossary that defeats the current classifier, reduced to one page.
+    """The ACID glossary of `TP2 Admin BD 2026_2027.pdf`, reduced to one page.
 
-    `TP2 Admin BD 2026_2027.pdf` loses 137 of its 140 differing tokens to this
-    shape. Columns separate cleanly and simple rows are recovered; what fails is
-    a cell that wraps, because then a visual line is not a row: the band holding
-    one cell's tail has fewer segments than its neighbours, so the region stops
-    looking like a table and falls back to flow.
+    A cell that wraps puts a row on more than one visual line: the band holding
+    one cell's tail has fewer segments than the rows around it, so a shape test
+    ("same segment count, same left edges") stops the table there and leaves the
+    rest of the glossary as flow paragraphs. The region classifier now grows by
+    column membership and merges a band whose cells are a strict subset of the
+    previous band's into that row, which recovers the glossary on the real
+    document as one table instead of a truncated one plus stray paragraphs.
 
-    This fixture exists so that the regression is visible the moment the fix
-    lands, and so a rewrite of the region classifier can be judged against a
-    file that is checked in rather than one that only exists on one machine.
+    What is still wrong here is the first row, whose *left* cell wraps as well:
+    when every cell of a row wraps, the second line fills exactly the same
+    columns as the first, and with no ruling lines read and an even pitch
+    between lines there is nothing geometric left to tell it from a second row -
+    so `Connecté en` and `session` come out as two rows. Printed tables use
+    their rulings for this. The day that is read too, this golden file changes
+    and the change gets read rather than trusted.
     """
     doc = new_document("TableWrapped")
     page = Page(doc)
@@ -184,8 +190,9 @@ def table_wrapped() -> None:
 
     col1, col2 = 76.6, 206.7
     # A row whose left cell wraps to two lines and whose right cell wraps to
-    # three: the tail-only band carries one segment where its neighbours carry
-    # two, which is what breaks the region.
+    # three. The right cell's tail band carries one segment where its neighbours
+    # carry two, and must merge back into the row; the left cell's second line
+    # is the part that still reads as a row of its own.
     page.at(col1, page.y, "Connecté en")
     page.at(col1, page.y + 14.0, "session")
     page.at(col2, page.y, "Utilisateur ayant ouvert")
