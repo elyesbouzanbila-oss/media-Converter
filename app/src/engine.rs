@@ -30,7 +30,7 @@
 //! the UI's threading assumptions — which is now how it actually runs.
 
 use crate::state::{JobId, TargetFormat};
-use dconv_engine::{Converter, EngineError};
+use dconv_engine::{Converter, EngineError, Format, PdfError, ReadStats, all_targets, targets_for};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -116,28 +116,28 @@ pub const WORKER_FLAG: &str = "--dconvert-worker";
 /// Which output formats the engine can produce for a file with this
 /// extension.
 ///
-/// Mirrors the closed match in `Converter::convert` plus `Format::from_path`:
-/// the only pair the facade accepts today is PDF → DOCX, and the UI must not
-/// offer a target that would silently fail. This table is the stand-in for the
-/// facade's own capability query (`supported(ext) -> [targets]`) — a contract
-/// ask is on file with the engine owner; once it lands, this asks the facade
-/// instead of mirroring it.
-///
-/// *Contract asks to the engine owner, both tiny:* re-export `PdfError` and
-/// `ReadStats` from `dconv-engine` (as `Sink` already is), so a front end can
-/// classify cancellation by variant and name the stats type without reaching
-/// for `dconv-pdf`.
-pub fn supported(source_ext: &str) -> &'static [TargetFormat] {
-    match source_ext.to_ascii_lowercase().as_str() {
-        "pdf" => &[TargetFormat::Docx],
-        _ => &[],
-    }
+/// Asks the facade instead of mirroring it: `Format::from_extension` owns the
+/// dot and the case, and [`targets_for`] walks the same `CONVERSIONS` table
+/// `Converter::convert` gates on, so what the settings panel offers and what
+/// a conversion would accept cannot drift apart. What remains is
+/// [`target_of`]'s deliberate seam: when the facade learns a target this UI
+/// does not name, `app` stops compiling there, which forces the mapping
+/// decision instead of hiding a new format behind a catch-all.
+pub fn supported(source_ext: &str) -> Vec<TargetFormat> {
+    let Some(source) = Format::from_extension(source_ext) else {
+        return Vec::new();
+    };
+    targets_for(source)
+        .into_iter()
+        .filter_map(target_of)
+        .collect()
 }
 
-/// The union of [`supported`] over every extension the engine reads — the
-/// list the settings panel offers.
-pub fn supported_targets() -> &'static [TargetFormat] {
-    supported("pdf")
+/// The union of [`supported`] over every file the engine reads — the list
+/// the settings panel offers. Taken from the facade's [`all_targets`], which
+/// is documented as exactly "the union a settings panel offers".
+pub fn supported_targets() -> Vec<TargetFormat> {
+    all_targets().into_iter().filter_map(target_of).collect()
 }
 
 /// Whether the engine reads this file's extension at all. Used to keep
@@ -150,6 +150,18 @@ pub fn readable(path: &Path) -> bool {
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
     !supported(&ext).is_empty()
+}
+
+/// Facade format → settings value, an *exhaustive* match on purpose. A
+/// catch-all would make a new facade target silently never appear in the
+/// settings panel; a missing arm makes `app` fail to compile until the UI
+/// owner classifies it. `Format::Pdf` refuses for a reason worth stating: a
+/// PDF is a source, never a target.
+fn target_of(format: Format) -> Option<TargetFormat> {
+    match format {
+        Format::Pdf => None,
+        Format::Docx => Some(TargetFormat::Docx),
+    }
 }
 
 // --- worker protocol: one JSON line per message, ids travel with events ---
@@ -270,14 +282,15 @@ fn worker_event(out: WorkerOut) -> Option<(EngineEvent, Option<u64>)> {
 /// Human words for a facade error: a short phrase for the log line, the full
 /// text for the details tab.
 ///
-/// Cancellation is *not* mapped here, on purpose. Cancellation surfaces from
-/// the facade as `PdfError::Cancelled` through the reader chain, and `PdfError`
-/// is not re-exported, so front ends cannot match it by variant. It does not
-/// matter yet: workers have no cooperative cancel — the parent kills the
-/// process — so `Cancelled` events are produced by the parent's death
-/// bookkeeping, never by this path. See the re-export ask on [`supported`].
+/// Cancellation matches by variant now that the facade re-exports `PdfError`.
+/// It still cannot arise in the worker path — workers have no cooperative
+/// cancel; the parent kills the process, and `Cancelled` events come from the
+/// parent's death bookkeeping — but this helper classifies whatever the
+/// facade returns, and mislabelling a cancel as a failure is exactly the
+/// confusion the re-export was asked for to prevent.
 fn explain_error(error: &EngineError) -> (String, Option<String>) {
     let summary = match error {
+        EngineError::Reader(PdfError::Cancelled) => "the conversion was cancelled",
         EngineError::UnknownFormat { .. } => "the file format could not be determined",
         EngineError::UnsupportedPair { .. } => "this output format is not supported yet",
         _ => "the conversion failed",
@@ -289,26 +302,22 @@ fn explain_error(error: &EngineError) -> (String, Option<String>) {
 ///
 /// Same rules as the CLI's `describe`: a converter that silently deletes
 /// characters must say so, and one that deletes none must not clutter the
-/// log with zeros. The number crunching is the facade's (`ReadStats`); per
-/// front end phrasing is presentation, so this lives here.
-///
-/// Takes plain integers rather than `ReadStats` because the type is not
-/// re-exported by the facade (see the ask on [`supported`]), and the tests
-/// should not need a real report to phrase warnings.
-fn warning_lines(
-    synthetic_dropped: usize,
-    control_dropped: usize,
-    dropped_dash: usize,
-) -> Vec<String> {
+/// log with zeros. The numbers come straight from the facade's `ReadStats`
+/// (re-exported alongside `Sink`); per-front-end phrasing is presentation,
+/// which is why the wording lives here and the counting does not have to.
+fn warning_lines(stats: &ReadStats) -> Vec<String> {
+    let control_dropped = stats.control_dropped();
     let mut out = Vec::new();
-    if synthetic_dropped > 0 || control_dropped > 0 {
+    if stats.synthetic_dropped > 0 || control_dropped > 0 {
         out.push(format!(
-            "discarded {synthetic_dropped} synthetic separators, {control_dropped} code points"
+            "discarded {} synthetic separators, {} code points",
+            stats.synthetic_dropped, control_dropped
         ));
     }
     // U+0002 is worth naming: PDFium maps some real hyphens to it, the
     // character is not recoverable, and the omission is visible in the text
     // (finding D3 — a wrong character would be invisible corruption).
+    let dropped_dash = stats.dropped_codepoints.get(&2).copied().unwrap_or(0);
     if dropped_dash > 0 {
         out.push(format!(
             "{dropped_dash} dash character(s) could not be read — PDFium maps some \
@@ -469,16 +478,7 @@ fn run_job(
     match converter.convert(&source, &output, &mut sink) {
         Ok(report) => {
             drop(sink); // the borrow must end before more emits borrow `out`
-            for text in warning_lines(
-                report.stats.synthetic_dropped,
-                report.stats.control_dropped(),
-                report
-                    .stats
-                    .dropped_codepoints
-                    .get(&2)
-                    .copied()
-                    .unwrap_or(0),
-            ) {
+            for text in warning_lines(&report.stats) {
                 emit(out, &WorkerOut::Warning { id, text });
             }
             emit(
@@ -1203,12 +1203,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_offers_only_what_the_facade_accepts() {
-        // The facade's closed match is PDF → DOCX and nothing else, so the
-        // table must not offer a target for a `.docx` input (no reader yet)
-        // or text output (no writer yet).
-        assert_eq!(supported("pdf"), &[TargetFormat::Docx]);
-        assert_eq!(supported("PDF"), &[TargetFormat::Docx], "case-insensitive");
+    fn capability_asks_the_facade_not_a_mirror() {
+        // The facade's CONVERSIONS table is PDF → DOCX and nothing else. The
+        // delegated query must reproduce exactly that: no target for a
+        // `.docx` input (no reader yet), none for `.txt` (no writer yet),
+        // while the dot and case handling is `Format::from_extension`'s job
+        // and no longer ours.
+        assert_eq!(supported("pdf"), vec![TargetFormat::Docx]);
+        assert_eq!(
+            supported("PDF"),
+            vec![TargetFormat::Docx],
+            "case-insensitive"
+        );
+        assert_eq!(supported(".pdf"), vec![TargetFormat::Docx], "dot tolerated");
         assert_eq!(supported_targets(), supported("pdf"));
         assert!(supported("docx").is_empty());
         assert!(supported("txt").is_empty());
@@ -1219,7 +1226,13 @@ mod tests {
     fn dropped_code_points_become_cli_worded_warnings() {
         // Same wording as the CLI's describe(): a converter that silently
         // deletes characters says so, and the unrecoverable dash gets named.
-        let warnings = warning_lines(2, 3, 3);
+        // U+0002 is the code point PDFium hands back for unreadable hyphens.
+        let stats = ReadStats {
+            synthetic_dropped: 2,
+            dropped_codepoints: [(2, 3)].into_iter().collect(),
+            ..ReadStats::default()
+        };
+        let warnings = warning_lines(&stats);
         assert_eq!(warnings.len(), 2);
         assert!(
             warnings[0].contains("2 synthetic separators"),
@@ -1232,7 +1245,7 @@ mod tests {
 
     #[test]
     fn a_clean_report_produces_no_warnings() {
-        assert!(warning_lines(0, 0, 0).is_empty());
+        assert!(warning_lines(&ReadStats::default()).is_empty());
     }
 
     #[test]
@@ -1249,6 +1262,11 @@ mod tests {
         };
         let (summary, _) = explain_error(&error);
         assert!(summary.contains("not supported"));
+
+        // Cancellation classifies by variant since `PdfError` is re-exported:
+        // it must never read as a conversion failure.
+        let (summary, _) = explain_error(&EngineError::Reader(PdfError::Cancelled));
+        assert!(summary.contains("cancelled"), "{summary}");
     }
 
     /// Runs only when the development tree has PDFium and fixtures present

@@ -167,7 +167,7 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                 .selected_text(app.settings.target.label())
                 .show_ui(ui, |ui| {
                     for f in crate::engine::supported_targets() {
-                        ui.selectable_value(&mut app.settings.target, *f, f.label());
+                        ui.selectable_value(&mut app.settings.target, f, f.label());
                     }
                 });
             ui.add_space(8.0);
