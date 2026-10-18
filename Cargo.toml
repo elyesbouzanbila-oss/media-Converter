@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "spikes/*"]
+# The engine lives under engine/ and the UI lives wherever you put it, so the
+# two never touch each other's files. When you create your crate, add its path
+# here — for example:
+#
+#     members = ["engine/*", "spikes/*", "app"]
+#
+# A glob is deliberately not used for the UI directory: cargo has to resolve
+# every match into a package, so a half-created directory would break the build
+# for both of us.
+members = ["engine/*", "spikes/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +19,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/docconvert"
 
 [workspace.dependencies]
-# --- our crates ---
-ir = { path = "crates/ir" }
+# --- our engine crates ---
+dconv-ir = { path = "engine/ir" }
+dconv-pdf = { path = "engine/pdf" }
+dconv-docx = { path = "engine/docx" }
+dconv-engine = { path = "engine/convert" }
 
 # --- serialization / errors ---
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +38,13 @@ crossbeam-channel = "0.5"
 # --- logging / diagnostics ---
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- command line ---
+clap = { version = "4", features = ["derive"] }
+
+# --- containers: a .docx is a zip of XML parts ---
+zip = "9"
+tempfile = "3"
 
 # --- pdf reading (FFI) ---
 pdfium-render = { version = "0.9.4", features = ["paragraph"] }

@@ -1,0 +1,20 @@
+[package]
+name = "dconv-cli"
+description = "Command line front end for the docconvert engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "dconv"
+path = "src/main.rs"
+
+[dependencies]
+dconv-ir = { workspace = true }
+dconv-engine = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

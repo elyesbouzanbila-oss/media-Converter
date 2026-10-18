@@ -1,10 +1,11 @@
 [package]
-name = "ir"
-description = "Format-agnostic document intermediate representation for docconvert"
+name = "dconv-ir"
+description = "Format-agnostic document intermediate representation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 serde = { workspace = true }

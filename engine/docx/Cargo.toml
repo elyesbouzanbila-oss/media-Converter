@@ -1,0 +1,14 @@
+[package]
+name = "dconv-docx"
+description = "DOCX writer: renders the document IR to Office Open XML"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dconv-ir = { workspace = true }
+zip = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }

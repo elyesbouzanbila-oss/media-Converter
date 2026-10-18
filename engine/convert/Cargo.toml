@@ -1,0 +1,16 @@
+[package]
+name = "dconv-engine"
+description = "Conversion facade: reader and writer selection, progress reporting, batch execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dconv-ir = { workspace = true }
+dconv-pdf = { workspace = true }
+dconv-docx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }

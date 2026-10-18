@@ -74,12 +74,29 @@ impl Length {
     /// English Metric Units, the integer unit used throughout OOXML.
     #[inline]
     pub const fn as_emu(self) -> i64 {
-        (self.0 * 12700.0) as i64
+        round_half_away(self.0 * 12700.0) as i64
     }
     /// Twips, the unit used by the legacy Word binary formats.
     #[inline]
     pub const fn as_twips(self) -> i32 {
-        (self.0 * 20.0) as i32
+        // Rounded, not truncated, and the difference is visible: A4 is
+        // 11905.5 x 16837.8 twips, so truncation yields 11905 x 16838-1 and a
+        // document whose page size silently changes the moment a user re-saves
+        // it in Word. Rounding gives Word's own canonical 11906 x 16838.
+        round_half_away(self.0 * 20.0) as i32
+    }
+}
+
+/// Round to the nearest integer, ties away from zero, in const context.
+///
+/// `f64::round` is not usable here: this is reached from `const fn`, and casts
+/// truncate toward zero, so the offset reproduces the tie-breaking behaviour
+/// without leaving const-evaluable code.
+const fn round_half_away(value: f64) -> f64 {
+    if value >= 0.0 {
+        (value + 0.5) as i64 as f64
+    } else {
+        (value - 0.5) as i64 as f64
     }
 }
 
