@@ -28,6 +28,7 @@ pub mod analyze;
 pub mod bind;
 pub mod glyph;
 pub mod layout;
+pub mod rules;
 
 pub use bind::{bind, bind_from};
 pub use dconv_ir as ir;
@@ -156,6 +157,7 @@ pub fn read_tracked(
 
     let mut stats = ReadStats::default();
     let mut page_bands: Vec<Vec<layout::Band>> = Vec::new();
+    let mut page_rules: Vec<Vec<rules::Rule>> = Vec::new();
     let mut page_setup = ir::PageSetup::default();
     let total = document.pages().len() as usize;
 
@@ -166,6 +168,9 @@ pub fn read_tracked(
 
         let extraction = glyph::extract_page(&page)
             .map_err(|error| PdfError::engine(format!("reading page {}", index + 1), error))?;
+        // Read before the blocks are built, because a table's row grouping
+        // needs the rulings; like the glyphs, they are page-level geometry.
+        let rulings = rules::extract(&page);
 
         stats.glyphs += extraction.glyphs.len();
         stats.synthetic_dropped += extraction.synthetic_dropped;
@@ -188,6 +193,7 @@ pub fn read_tracked(
         let bands = layout::analyse_page(&extraction.glyphs, space_em);
         stats.bands += bands.len();
         page_bands.push(bands);
+        page_rules.push(rulings);
 
         sink.page(index + 1, total);
     }
@@ -207,7 +213,12 @@ pub fn read_tracked(
         if index > 0 {
             blocks.push(ir::Block::PageBreak);
         }
-        blocks.extend(analyze::build_page(bands, &profile, &page_setup));
+        blocks.extend(analyze::build_page(
+            bands,
+            &page_rules[index],
+            &profile,
+            &page_setup,
+        ));
     }
 
     let mut out = ir::Document {

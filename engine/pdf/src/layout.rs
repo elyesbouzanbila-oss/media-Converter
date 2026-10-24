@@ -106,6 +106,13 @@ const BAND_SEARCH: usize = 6;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub text: String,
+    /// The left edge of each character in `text`, in the same order. Synthesized
+    /// spaces take the x of the glyph that triggered the gap. This is what
+    /// lets the analyser cut a segment that fused two columns — a footnote
+    /// marker, a glossary term running into its definition — at the gap
+    /// between them: layout itself has no page-level evidence for where the
+    /// boundary lies, so it must keep the per-character positions alive.
+    pub x: Vec<f32>,
     pub bold: bool,
     pub italic: bool,
     pub size: f32,
@@ -138,6 +145,12 @@ pub struct Segment {
     pub size: f32,
     pub bold: bool,
     pub italic: bool,
+    /// Inter-glyph gaps as (right edge of the preceding glyph, width), in glyph
+    /// order, for every gap wide enough to have earned a synthesized space —
+    /// the same gaps `build_segment` turns into spaces, recorded here so the
+    /// analyser can cut a fused segment through one of them. A kerning slip
+    /// narrower than a space is never a column boundary and is not recorded.
+    pub gaps: Vec<(f32, f32)>,
 }
 
 impl Segment {
@@ -341,6 +354,7 @@ fn build_segment(glyphs: &[&Glyph], space_em: f32) -> Segment {
     let baseline = dominant_baseline(glyphs, provisional);
 
     let mut runs: Vec<Run> = Vec::new();
+    let mut gaps: Vec<(f32, f32)> = Vec::new();
     let mut previous_right: Option<f32> = None;
 
     for glyph in glyphs {
@@ -351,12 +365,20 @@ fn build_segment(glyphs: &[&Glyph], space_em: f32) -> Segment {
                 .map(|run| run.text.ends_with(' '))
                 .unwrap_or(false);
 
-            if gap > word_gap && !already_spaced {
-                push_run(&mut runs, " ", style_of(glyph, baseline, size));
+            if gap > word_gap {
+                gaps.push((previous, gap));
+                if !already_spaced {
+                    push_run(&mut runs, " ", Some(glyph.x), style_of(glyph, baseline, size));
+                }
             }
         }
 
-        push_run(&mut runs, &glyph.ch.to_string(), style_of(glyph, baseline, size));
+        push_run(
+            &mut runs,
+            &glyph.ch.to_string(),
+            Some(glyph.x),
+            style_of(glyph, baseline, size),
+        );
         previous_right = Some(glyph.right);
     }
 
@@ -381,12 +403,14 @@ fn build_segment(glyphs: &[&Glyph], space_em: f32) -> Segment {
         bold: majority(glyphs, |g| g.bold),
         italic: majority(glyphs, |g| g.italic),
         runs,
+        gaps,
     }
 }
 
 fn style_of(glyph: &Glyph, baseline: f32, segment_size: f32) -> Run {
     Run {
         text: String::new(),
+        x: Vec::new(),
         bold: glyph.bold,
         italic: glyph.italic,
         size: glyph.size,
@@ -415,16 +439,20 @@ fn vertical_shift(glyph: &Glyph, baseline: f32, segment_size: f32) -> VerticalSh
     }
 }
 
-fn push_run(runs: &mut Vec<Run>, text: &str, style: Run) {
+fn push_run(runs: &mut Vec<Run>, text: &str, x: Option<f32>, style: Run) {
     if let Some(last) = runs.last_mut() {
         if last.same_style(&style) {
             last.text.push_str(text);
+            for _ in text.chars() {
+                last.x.push(x.unwrap_or(0.0));
+            }
             return;
         }
     }
 
     let mut run = style;
     run.text = text.to_string();
+    run.x = text.chars().map(|_| x.unwrap_or(0.0)).collect();
     runs.push(run);
 }
 

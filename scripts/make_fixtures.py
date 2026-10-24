@@ -14,7 +14,7 @@ Each document targets one behaviour that has a rule or a finding behind it:
 
   headings      heading levels from size and spacing (analyze.rs)
   table         a clean two-column region recovered as a real Word table
-  table-wrapped a cell that wraps — the known-bad case, locked in as a baseline
+  table-wrapped a ruled table whose every cell wraps, grouped by its rulings
   list          bullet and ordered markers, including `1.` `1)` and `(1)`
   script        a superscript, which is why bands re-anchor (finding D7)
   columns       a two-column page, against COLUMN_LAYOUT_HEIGHT_FRACTION
@@ -170,18 +170,20 @@ def table_wrapped() -> None:
     A cell that wraps puts a row on more than one visual line: the band holding
     one cell's tail has fewer segments than the rows around it, so a shape test
     ("same segment count, same left edges") stops the table there and leaves the
-    rest of the glossary as flow paragraphs. The region classifier now grows by
+    rest of the glossary as flow paragraphs. The region classifier grows by
     column membership and merges a band whose cells are a strict subset of the
-    previous band's into that row, which recovers the glossary on the real
-    document as one table instead of a truncated one plus stray paragraphs.
+    previous band's into that row.
 
-    What is still wrong here is the first row, whose *left* cell wraps as well:
-    when every cell of a row wraps, the second line fills exactly the same
-    columns as the first, and with no ruling lines read and an even pitch
-    between lines there is nothing geometric left to tell it from a second row -
-    so `Connecté en` and `session` come out as two rows. Printed tables use
-    their rulings for this. The day that is read too, this golden file changes
-    and the change gets read rather than trusted.
+    The first row wraps *both* cells, so its second line fills exactly the same
+    columns as the first and an even pitch leaves no shape to tell it from a
+    second row. The table is therefore drawn with the rulings a printed table
+    has: horizontal borders between the rows (thin filled rectangles, Word's
+    shape, plus one stroked outer border) and vertical borders between the
+    columns. `analyze::build_table` reads the horizontal ones: a rule between
+    two bands ends the row, and its absence means they belong together. Before
+    that, this golden pinned `Connecté en` and `session` as two rows; it now
+    reads as one, which is the change the old docstring predicted would happen
+    when the rulings were read.
     """
     doc = new_document("TableWrapped")
     page = Page(doc)
@@ -189,10 +191,13 @@ def table_wrapped() -> None:
     page.gap(26.0)
 
     col1, col2 = 76.6, 206.7
+    rule_left, rule_right = 70.6, 528.0
+
     # A row whose left cell wraps to two lines and whose right cell wraps to
     # three. The right cell's tail band carries one segment where its neighbours
     # carry two, and must merge back into the row; the left cell's second line
-    # is the part that still reads as a row of its own.
+    # is the part only the rulings can tell from a row of its own.
+    first = page.y
     page.at(col1, page.y, "Connecté en")
     page.at(col1, page.y + 14.0, "session")
     page.at(col2, page.y, "Utilisateur ayant ouvert")
@@ -200,13 +205,51 @@ def table_wrapped() -> None:
     page.at(col2, page.y + 28.0, "serveur applicatif.")
     page.y += 42.0
 
+    second = page.y
     page.at(col1, page.y, "Droits")
     page.at(col2, page.y, "Permissions accordées au profil.")
     page.y += 16.0
 
+    third = page.y
     page.at(col1, page.y, "Profil")
     page.at(col2, page.y, "Ensemble de droits partagés.")
     page.y += 30.0
+
+    # The rules sit in the gaps between the loose boxes, not on the baselines.
+    # Measured from the bands this fixture produces: PDFium's 11pt Helvetica box
+    # reaches 2.3pt below a baseline and 10.0pt above the next, so the 14pt pitch
+    # between row 1's last line and row 2 leaves a 1.72pt gap, and the 16pt pitch
+    # to row 3 leaves 3.72pt. The two inner rules sit at the midpoints of those
+    # gaps (PDF y 698.6 and 683.6), not at a round offset that might land inside
+    # a band's loose box.
+    def hline(y: float, filled: bool) -> None:
+        if filled:
+            page.page.draw_rect(
+                pymupdf.Rect(rule_left, y, rule_right, y + 0.4),
+                color=None,
+                fill=(0.6, 0.6, 0.6),
+            )
+        else:
+            page.page.draw_line(
+                (rule_left, y),
+                (rule_right, y),
+                color=(0.6, 0.6, 0.6),
+                width=0.4,
+            )
+
+    hline(first - 12.0, filled=False)
+    hline(second - 10.8, filled=True)
+    hline(third - 11.8, filled=True)
+    hline(third + 6.0, filled=False)
+    # Vertical borders: extracted as thin vertical paths and deliberately
+    # ignored by `rules::extract`, which reads horizontal rules only.
+    for x in (rule_left, 200.7, rule_right):
+        page.page.draw_line(
+            (x, first - 12.0),
+            (x, third + 6.0),
+            color=(0.6, 0.6, 0.6),
+            width=0.4,
+        )
 
     page.para("Ces définitions sont indicatives.")
     save(doc, "table-wrapped")

@@ -497,3 +497,152 @@ priority. The gap list in `AGENTS.md` says so.
   marker with its item across a `<w:tab/>`, which reads as `•Tester`. That is now
   a rule about `w:tab` and `w:br`, not a guess.
 
+# Stage 1 - the Session blocks read row-major
+
+## Finding D14 - a full-width fused row carries its own cut
+
+Pages 4–6 of `TP2 Admin BD 2026_2027.pdf` lay exercises out as two answer
+columns under a bold `Session A / Session B` header, and each exercise's first
+line is **one fused segment**: the two cells sit 10.16 and 13.14pt apart —
+wider than a word space, narrower than the 1.6em (17.6pt at 11pt) segment
+threshold, so the bander fuses them and records the carrier gap in the
+segment's own gap list. Reading the page across instead of down starts there.
+
+The split pass used to refuse such a row outright whenever its ink span
+crossed the full-width threshold (`FULL_WIDTH_CUT_FRACTION`, 0.95 of the
+page's content width). The refusal existed to protect justified running text,
+whose word gaps can inflate enough to carry a cut anywhere. The refusal asked
+the wrong question: it looked at the band's *ink span*, not at the gap that
+has to carry the cut. Page 4's 5.2 row spans [62.83, 534.47] = 471.64pt across
+the 457.9pt threshold and carries the cut inside its own (300.54, 10.16) gap —
+a gap every other rule already classifies as a column gutter. Refusing it
+threw away the window's strongest straddler, and with it the whole Session
+block, which then read as cross-read flow.
+
+Relaxing the gate was measured three times, and only the last was the fix:
+
+- c3 (relax alone): **+14** word errors on TP2. Not the gate's fault — the
+  selection below was picking the wrong window, so the relax exposed more
+  pages to it.
+- c4 (relax + earliest-start selection, D15): every Session window records,
+  WER back to 5.84%. Cutting at the (300.54, 10.16) gap's midpoint (305.62)
+  splits the fused row into its two cells, and `cut_segment`'s own guards (a ≥0.55em gap,
+  pieces ≥0.5em, mono refusal) plus the corroboration gates at
+  `evaluate_cut` (≥2 straddlers, ≥3 pieces on a side, ≥12% width shares,
+  aligned anchors) are what keep justified text out. The same c3 session
+  measured the protection empirically: the justified bands never pass —
+  consecutive lines' word gaps do not align within a point, and a two-line
+  fake never reaches three pieces.
+
+Page 4's recorded windows now: [1..5) at cut 298.72 (5.1), [10..16) at cut
+305.62 with columns [61.825, 309.7] (5.2), and [20..26); the other pages
+are unchanged from the pre-stage state (page 1 [8..16) and [36..39), page 2
+[0..7), page 3 [1..8) STREAM at 424.27, page 5 [31..37), page 6 [6..12)).
+
+## Finding D15 - widest-wins loses the upper window
+
+`best_strip` walks every band's qualifying gaps from the scan point and used
+to keep an incumbent unless a newcomer ran *wider*. Page 3 has two Session
+blocks stacked, so a wider lower window evaluated from band 0 shadowed the
+narrower upper one: the scans never came back, and every page in the document
+kept at most one table window. Reading order is top to bottom, so the rule
+now is: adopt the window that opens **earliest**; from the same first band,
+prefer the wider one; otherwise keep the incumbent. Structure nearest the
+scan point is read first — the same order a reader applies.
+
+Two regression tests pin the geometry, both from the measured block (the
+helper's fixed glyph widths render the prose a few points wider than the
+document's font, so the cell origins, gap widths and pitches are the measured
+values and the cut positions follow from them):
+
+- `a_full_width_fused_row_is_cut_at_its_own_gap` — the 5.2 block alone: a
+  fused row split at its 10.16pt carrier gap despite a full-width span, with
+  the one-sided `[B2]`/`[A2]` rows corroborating and feeding the table.
+- `two_tiered_session_blocks_yield_two_tables` — 5.1 and 5.2 stacked: both
+  windows record, in page order, and the Question line between them refuses
+  both cuts (its 1.1pt word gaps sit under the 6.05pt minimum) — the wall
+  that ends each walk is part of the geometry under test.
+
+## What Stage 1 does not change, and what is next
+
+- **Word error rate does not move**: TP2 stays at 5.84% (118 of 2022, missing
+  3 / extra 3 — the U+0002 hyphens), 3IRS stays at 1.28% (missing 1 / extra
+  1). The row-major emission is token-identical to the cross-read flow it
+  replaced, because `build_table`'s subset-merge folds the one-sided tail
+  bands into the last row either way. Only `[A2]` relocates (row-major reads
+  the left cell before the right). Stage 1 buys *structure*: the Session
+  blocks are now real 2-column tables in the IR and in the `.docx`, visible
+  in `--dump` and in Word.
+- **The every-cell-wrapped row** — 5.2's band 12 fills both columns with the
+  second line of each cell, a strict subset of nothing's band shape — still
+  emits as its own row. That is the gap list's second entry and Stage 2's
+  job: read the table's ruling lines. Line pitch cannot separate the rows:
+  Word's cell leading runs at the same pitch as the cells it wraps.
+- The dead `content_width` chain (through `cut_columns`, `best_strip`,
+  `evaluate_cut`, `apply_cut`, `split_window`) is gone; the full-width gate
+  was its only consumer.
+- Test count 105 (was 103): the two tests above.
+
+# Stage 2 - a row whose every cell wraps
+
+## Finding D16 - the producer's rulings are the only evidence left
+
+Page 2's glossary and page 4's 5.2 block both contain a row whose **every** cell
+wraps. The subset test that recovers a one-sided tail sees the second line
+filling exactly the same columns as the first and calls it a new row. No text is
+lost, but the row is split in two, and the `.docx` reads it as two rows where
+MuPDF reads one block per cell.
+
+The rulings were there all along. Word draws each cell border as its own thin
+filled path: measured on page 1 of `TP2 Admin BD 2026_2027.pdf`, a row border is
+0.4pt high and split at the column border into `72.22..181.85` and
+`182.25..523.38` — a 0.4pt gap that is the vertical border's own width. Page 2's
+glossary has four horizontal rules at PDF y 757.57 / 710.77 / 677.37 / 643.95;
+the outer two are the table's top and bottom edges, the inner two are row
+boundaries. Page 1's shaded header row is a 2.0pt-high filled rectangle and must
+not count as a rule, which is what the 1.5pt thickness bound rejects.
+
+The fix is `engine/pdf/src/rules.rs` plus the row grouping in `build_table`:
+
+- Extract thin horizontal paths, merge collinear per-cell pieces across gaps of
+  at most 1pt, and keep the rule's measured centre.
+- A rule is **internal** to a table when it lies strictly between the first
+  band's top and the last band's bottom and crosses at least 50% of the table's
+  text width. A single cell's border covers only 28% of the glossary, so the
+  merge is load-bearing rather than cosmetic.
+- A table is **ruled** at two internal rules. One is deliberately not enough: a
+  table that rules only its header would otherwise merge every body row into
+  one. The glossary has two; the guard is what keeps a header-only table safe.
+- In a ruled table, a rule between two bands ends the row; absence of a rule
+  means the bands belong together, whatever their column shape. Without rulings
+  the old subset test still runs, so nothing regresses on unruled tables.
+
+What it buys, measured with `scripts/compare_docx.py`: TP2 moves from 5.84% to
+**3.76%** (76 of 2022, similarity 97.92%), with missing/extra unchanged at 3/3 —
+still the U+0002 hyphens. The glossary is a 3×2 table with both wrapped cells
+joined, and 5.2/5.3 read `A1 | B1`, then `B2`, then `A2`, the order MuPDF gives
+them. 3IRS is unchanged at 1.28% (21 of 1640, 1/1). The rest of TP2's difference
+is reading order (the page-3 script list, gap 1, and the header/footer segment
+order) and the dropped hyphens; Stage 2 did not touch either.
+
+Known limits, stated rather than hidden:
+
+- A fully ruled table with exactly two rows has one internal rule, so it stays
+  on the subset test; an every-cell-wrapped two-row table therefore still
+  splits. The fixture has three rows and two internal rules, so it is on the
+  fixed side of the guard.
+- A producer that draws the whole grid as one path object has no thin edge to
+  read. Both real documents and the fixture draw one object per border.
+
+`tests/fixtures/synthetic/table-wrapped.pdf` now carries the rulings: thin
+filled rectangles for the inner borders, stroked lines for the outer border, and
+vertical borders that `rules::extract` deliberately ignores. Its golden changed
+from four rows to the three above, and the change was read before it was
+blessed. `columns` is now the only fixture whose golden pins known-wrong output.
+
+Tests: 112 (was 105). `rules.rs` adds four (thin/long accepted, corner square
+and shading rejected, the 0.4pt column gap merges, a 5pt gap does not);
+`analyze.rs` adds three from measured geometry — the page-2 glossary with its
+real rules, 5.2's one-sided `[B2]` row kept apart by its rule, and a header-only
+rule that must not license merging.
+

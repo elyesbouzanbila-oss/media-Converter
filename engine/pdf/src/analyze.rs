@@ -25,6 +25,7 @@ use std::cmp::Ordering;
 
 use crate::ir;
 use crate::layout::{Band, Run, Segment};
+use crate::rules::Rule;
 
 /// A longer line is never a heading, however large its type. Guards against a
 /// stray oversized glyph headlining an entire paragraph.
@@ -37,6 +38,24 @@ const COLUMN_TOLERANCE_EM: f32 = 0.9;
 /// Fewer aligned rows than this is not a table. Two lines that happen to line up
 /// are a coincidence of layout, not structure.
 const MIN_TABLE_ROWS: usize = 2;
+
+/// The fewest horizontal rules that must fall inside a table before absence of
+/// a rule between two bands means "the same row".
+///
+/// A printed table very often rules only its header. Treating every unruled gap
+/// as a continuation there would merge the whole body into one row, so one
+/// internal rule is never enough. The glossary this rule exists for carries two
+/// (page 2 of `TP2 Admin BD 2026_2027.pdf`, at y=710.77 and 677.37); a fully
+/// ruled table with only two rows has one and stays on the subset rule, which
+/// is the safe side.
+const MIN_INTERNAL_RULES: usize = 2;
+
+/// How much of a table's text width a rule must cross to bound its rows.
+///
+/// Word draws one border per cell, and `rules::merge` joins the pieces; a
+/// single cell's border alone covers only 28% of the two-column glossary's
+/// text width, so an unmerged fragment is not evidence of a row boundary.
+const RULE_COVERAGE: f32 = 0.5;
 
 /// A two-segment region spanning more than this fraction of the content height
 /// is a two-column page rather than a one-column table.
@@ -59,6 +78,55 @@ const CENTRED_SLACK_EM: f32 = 1.5;
 const INDENT_TOLERANCE_EM: f32 = 0.9;
 
 const BULLETS: &[char] = &['•', '▪', '‣', '·', '○', '◦', '▪', '–', '—', '-', '*'];
+
+/// The smallest gap through which a fused segment may be split when page-level
+/// evidence says two columns meet there.
+///
+/// Measured on the real documents: the inter-glyph gaps that ARE column
+/// boundaries run 6.86pt (the glossary term running into its definition, page 2
+/// of `TP2 Admin BD 2026_2027.pdf`) up to 16.3pt (footnote marker 2 hanging in
+/// the table gutter, page 3), which is 0.62em to 1.48em of the 11pt body.
+/// Ordinary word gaps in the same justified text measure up to 7pt, so raw
+/// width cannot separate a boundary from a stretched space, and no constant
+/// tries to. What separates them is that a boundary is *reusable*: the cut must
+/// clear every band it crosses, not just the band it came from — that is what
+/// the window walk enforces. This constant only has to reject gaps that could
+/// never carry a boundary (kerning, tight spacing) while the measured tightest
+/// boundary, 0.62em, stays admissible.
+const CUT_MIN_GAP_EM: f32 = 0.55;
+
+/// A cut must leave at least this much ink on each side of its gap, in em of
+/// the segment's own size. The footnote markers the cut peels onto the table
+/// side measure 5.87pt wide — 0.53em of the 11pt body — so anything slimmer
+/// than that is kerning, not a leftover word.
+const MIN_CUT_PIECE_EM: f32 = 0.5;
+
+/// How much of a window's content width each side of a cut must carry. This is
+/// the second strip gate from the working notes: the account table's own
+/// internal gutter, measured at [501.20, 521.77] on page 3 of
+/// `TP2 Admin BD 2026_2027.pdf`, leaves 28.9pt on the right of a 490pt window —
+/// 5.9% — and is refused here as well as by the overlap rule below.
+const MIN_STRIP_SHARE: f32 = 0.12;
+
+/// The fewest bands that must carry content on both sides of a cut before the
+/// cut means a column boundary rather than a coincidence of spacing.
+const MIN_STRIP_STRADDLERS: usize = 2;
+
+/// A window must collect at least this many pieces on one side before a cut
+/// means a structure this pass exists for. Every multi-column case the pass is
+/// for carries three or more on a side (the script list: eight on the left);
+/// demanding three refuses the two-piece accident where two consecutive
+/// justified lines each happen to carry the cut and would otherwise read as a
+/// two-row table. Structures that small still classify as tables through the
+/// ordinary region rules, which need no cut at all.
+const MIN_STRIP_PIECES: usize = 3;
+
+/// A one-sided band joins an opened window only while its largest glyph stays
+/// within this factor of the largest glyph the two-sided bands carry. The
+/// trailing list items (11pt under an 11pt body) and a Session exercise's
+/// wrapped cell line belong to the strip; "Question :" (12pt, page 4) and
+/// "3. Contrôle transactionnel" (13pt, page 3) do not.
+const TRAILING_SIZE_FACTOR: f32 = 1.05;
 
 /// Document-wide typographic facts, derived before any block is built.
 #[derive(Debug, Clone)]
@@ -168,19 +236,72 @@ impl Line {
 }
 
 /// Build the blocks for one page.
-pub fn build_page(bands: &[Band], profile: &DocumentProfile, page: &ir::PageSetup) -> Vec<Block> {
+pub fn build_page(
+    bands: &[Band],
+    rules: &[Rule],
+    profile: &DocumentProfile,
+    page: &ir::PageSetup,
+) -> Vec<Block> {
+    let (bands, windows) = cut_columns(bands);
     let mut blocks = Vec::new();
     let mut index = 0;
 
     while index < bands.len() {
+        // A window the cut pass already decided: row-major windows go to the
+        // table builder directly; stream windows are read as two regions, the
+        // left strip first, the right after — the reading MuPDF gives the
+        // script list beside the account table.
+        if let Some((_, window)) = windows.iter().find(|(start, _)| *start == index) {
+            match (&window.columns, window.cut) {
+                (Some(columns), _) => {
+                    blocks.push(build_table(&bands, index, window.end, columns, rules));
+                }
+                (None, Some(cut)) => {
+                    let (lefts, rights) =
+                        split_window(&bands[index..window.end], cut);
+                    emit_region(&lefts, rules, profile, page, &mut blocks);
+                    emit_region(&rights, rules, profile, page, &mut blocks);
+                }
+                (None, None) => unreachable!("a recorded window is a table or a stream"),
+            }
+            index = window.end;
+            continue;
+        }
+
+        // Everything before the next recorded window is one region.
+        let end = windows
+            .iter()
+            .map(|(start, _)| *start)
+            .filter(|start| *start > index)
+            .min()
+            .unwrap_or(bands.len())
+            .max(index + 1);
+        emit_region(&bands[index..end], rules, profile, page, &mut blocks);
+        index = end;
+    }
+
+    blocks
+}
+
+/// Classify and emit one region of bands — the part of a page between
+/// recorded strip windows, or one side of a stream window.
+fn emit_region(
+    bands: &[Band],
+    rules: &[Rule],
+    profile: &DocumentProfile,
+    page: &ir::PageSetup,
+    blocks: &mut Vec<Block>,
+) {
+    let mut index = 0;
+    while index < bands.len() {
         match classify_region(bands, index, page) {
             Region::Table { end, columns } => {
-                blocks.push(build_table(bands, index, end, &columns));
+                blocks.push(build_table(bands, index, end, &columns, rules));
                 index = end;
                 continue;
             }
             Region::Columns { end, count } => {
-                emit_columns(bands, index, end, count, profile, &mut blocks);
+                emit_columns(bands, index, end, count, profile, blocks);
                 index = end;
                 continue;
             }
@@ -194,11 +315,9 @@ pub fn build_page(bands: &[Band], profile: &DocumentProfile, page: &ir::PageSetu
         while end < bands.len() && matches!(classify_region(bands, end, page), Region::Flow) {
             end += 1;
         }
-        emit_flow(&bands[start..end], profile, &mut blocks);
+        emit_flow(&bands[start..end], profile, blocks);
         index = end;
     }
-
-    blocks
 }
 
 /// What a span of rows, taken from `start`, structurally is.
@@ -401,6 +520,590 @@ fn grow_run(bands: &[Band], start: usize) -> usize {
     }
 
     end
+}
+
+/// One page-region refinement: a run of bands drawn from two vertical streams
+/// or a two-column structure, cut apart at a known boundary before any region
+/// is classified.
+#[derive(Debug)]
+struct StripWindow {
+    /// One past the last band of the window.
+    end: usize,
+    /// For a row-major window (`table`): the two columns, already cut into
+    /// every band of the window.
+    columns: Option<Vec<f32>>,
+    /// For a stream window: the cut each side was drawn at, applied at emit
+    /// time — the bands stay interleaved here so every index in the vector
+    /// keeps its meaning.
+    cut: Option<f32>,
+}
+
+/// What a per-candidate cut evaluation concluded.
+#[derive(Debug)]
+struct StripPlan {
+    /// First band carrying content on both sides of the cut: the window opens
+    /// there, because one-sided bands above the structure belong to the flow
+    /// (a heading, page furniture), not to a side.
+    start: usize,
+    /// One past the last band of the window.
+    end: usize,
+    cut: f32,
+    table: bool,
+    columns: Vec<f32>,
+}
+
+/// Cut the columns page-level evidence identifies, before anything is
+/// classified.
+///
+/// Two structures defeat region classification from the outside, and both live
+/// on the real documents: a segment that fused two columns — the footnote
+/// markers `1`/`2`/`3` the producer set at the account table's own left edge
+/// inside the list's lines, "[A1] Modifiez (sans valider) le solde du" running
+/// into "[B1] Interrogez le solde du compte n°1." across a 10.7pt gap, the
+/// glossary term running into its definition across 6.9pt — so no band shows
+/// the columns it belongs to; and one-sided bands (the list beside the account
+/// table) poisoning every column the region machinery grows. The cut pass
+/// works the other way round from classification: it asks where a page could
+/// be divided into vertical strips — the question the working notes posed —
+/// and once per window decides between two readings of the same split:
+///
+/// * both sides line up band after band → row-major: a table. The glossary and
+///   the Session A/B blocks want this (MuPDF reads them row by row), and the
+///   window's columns are handed to the table builder directly.
+/// * one side is its own stream → column-major: every band's left pieces in
+///   band order, then every band's right pieces. The script list beside the
+///   account table wants this.
+///
+/// Both gates from the working notes apply to every candidate: at least two
+/// bands carrying content on both sides, and both sides carrying a real share
+/// of the window's width — which is what refuses the account table's own
+/// internal gutter. Two further gates keep a cut honest: the cut may not leave
+/// overlapping ink inside one side (at a cut inside the account table, the
+/// marker cells would overlap the list's own segments, because they have no
+/// independent existence), and full-width lines are never carriers.
+fn cut_columns(bands: &[Band]) -> (Vec<Band>, Vec<(usize, StripWindow)>) {
+    let mut bands: Vec<Band> = bands.to_vec();
+    let mut windows: Vec<(usize, StripWindow)> = Vec::new();
+    let mut index = 0;
+
+    while index < bands.len() {
+        if let Some(plan) = best_strip(&bands, index) {
+            if plan.table {
+                // Row-major: fold the cut pieces into each band now; every
+                // index stays where it was.
+                apply_cut(&mut bands, plan.start, plan.end, plan.cut);
+                windows.push((
+                    plan.start,
+                    StripWindow {
+                        end: plan.end,
+                        columns: Some(plan.columns),
+                        cut: None,
+                    },
+                ));
+            } else {
+                // Stream: record the cut, keep the bands interleaved — the
+                // split into sides happens when the window is emitted, each
+                // side then classified as its own region.
+                windows.push((
+                    plan.start,
+                    StripWindow {
+                        end: plan.end,
+                        columns: None,
+                        cut: Some(plan.cut),
+                    },
+                ));
+            }
+            index = plan.end;
+        } else {
+            index += 1;
+        }
+    }
+
+    (bands, windows)
+}
+
+/// Split a stream window's bands at its cut, handing back the left and right
+/// strips as band sequences in band order. Evaluation walked the same bands in
+/// the same state, so a refusal here would mean the two disagreed.
+fn split_window(window: &[Band], cut: f32) -> (Vec<Band>, Vec<Band>) {
+    let mut lefts = Vec::new();
+    let mut rights = Vec::new();
+
+    for band in window {
+        let Some((left, right)) = split_band(band, cut) else {
+            unreachable!("the band admitted this cut during evaluation");
+        };
+        if !left.is_empty() {
+            lefts.push(Band {
+                segments: left,
+                bottom: band.bottom,
+                top: band.top,
+            });
+        }
+        if !right.is_empty() {
+            rights.push(Band {
+                segments: right,
+                bottom: band.bottom,
+                top: band.top,
+            });
+        }
+    }
+
+    (lefts, rights)
+}
+
+/// Whether any run of the segment is set in a monospaced programming face,
+/// judged by the embedded (subset-prefixed) font name.
+///
+/// Code lines ("SET TRANSACTION …; -- fixe les propriétés", page 1 of
+/// `TP2 Admin BD 2026_2027.pdf`, and the SELECT lines of 2.6 on page 2) hang
+/// their trailing comment at a comment column a few points past the code, and
+/// Consolas's word gaps are carrier-sized, so every space in them invites a
+/// cut. Real column boundaries — the glossary at 206.67, the Session blocks
+/// at 302.70 — live in proportional text. A monospaced run therefore never
+/// carries a cut, and the code|comment pseudo-columns its lines invite read
+/// line-major, which is what the fidelity reference gives them too.
+///
+/// The advance-statistics alternative was measured and discarded: the
+/// producer quantizes Consolas's positions to ~0.1pt so its steps alternate
+/// between two widths 3% apart, while display faces ("Anomalies et Niveaux
+/// d'Isolation", 13pt, advances n/o/a/e/u/d at exactly 6.19pt) and this
+/// document's own Aptos body text both produce more equal-looking steps than
+/// the code does. Names separate the classes exactly where statistics
+/// cannot.
+const MONO_FONTS: &[&str] = &[
+    "consolas",
+    "courier",
+    "mono",
+    "menlo",
+    "inconsolata",
+    "jetbrains",
+    "fira code",
+    "source code",
+    "pragmata",
+    "hack",
+];
+
+fn monospace(segment: &Segment) -> bool {
+    segment.runs.iter().any(|run| {
+        run.font
+            .as_deref()
+            .is_some_and(|font| {
+                let font = font.to_ascii_lowercase();
+                MONO_FONTS.iter().any(|mark| font.contains(mark))
+            })
+    })
+}
+
+/// The best cut for a window beginning anywhere at or after `scan`.
+///
+/// Candidates come from the recorded inter-glyph gaps themselves — a cut has to
+/// sit inside a gap of every segment it crosses, so its position is bounded by
+/// the gaps of the bands it came from. Several cuts inside the same compatible
+/// gap produce identical pieces (every character boundary is fixed), so the
+/// choice only has to prefer the window whose bands sit nearest the scan
+/// point — keep an incumbent unless a newcomer opens earlier (or, from the
+/// same first band, runs wider).
+fn best_strip(bands: &[Band], scan: usize) -> Option<StripPlan> {
+    let mut best: Option<StripPlan> = None;
+
+    for band in &bands[scan..] {
+        for segment in &band.segments {
+            let minimum = segment.size * CUT_MIN_GAP_EM;
+            for &(gap_right, gap_width) in &segment.gaps {
+                if gap_width < minimum {
+                    continue;
+                }
+                let cut = gap_right + gap_width * 0.5;
+                if let Some(plan) = evaluate_cut(bands, scan, cut) {
+                    best = Some(match best {
+                        // Adopt the newcomer when it starts earlier (or,
+                        // from the same band, runs wider); keep the
+                        // incumbent otherwise.
+                        Some(previous) if better_strip(&previous, &plan) => plan,
+                        Some(previous) => previous,
+                        None => plan,
+                    });
+                }
+            }
+        }
+    }
+
+    best
+}
+
+fn better_strip(previous: &StripPlan, plan: &StripPlan) -> bool {
+    // The structure nearest the scan point is read first: a window opening
+    // above another one belongs to a different, smaller block — page 4's
+    // 5.1 table [1..5) — and must not wait behind a wider later window
+    // [10..16) whose only claim is reach. Equal starts adopt the wider
+    // reach; equal windows keep the first evaluated.
+    plan.start < previous.start
+        || (plan.start == previous.start && plan.end > previous.end)
+}
+
+/// Evaluate one candidate cut: walk the bands from `scan` while they admit it,
+/// gate the window that opens, and decide row-major against stream.
+fn evaluate_cut(bands: &[Band], scan: usize, cut: f32) -> Option<StripPlan> {
+    let mut window: Vec<(usize, Vec<Segment>, Vec<Segment>)> = Vec::new();
+    let mut straddlers = 0usize;
+    let mut straddler_size = 0.0f32;
+
+    for (index, band) in bands.iter().enumerate().skip(scan) {
+        let (left, right) = match split_band(band, cut) {
+            Some(pieces) => pieces,
+            // The cut does not clear this band. Above the structure that
+            // means the band is not part of any column read — the question
+            // lines and the heading between a block and its predecessor
+            // refuse every cut, and the Session 5.2 block's fused row died
+            // against them when a refusal here killed the candidate. Bands
+            // have to be straddled into a window, not admitted into one, so
+            // what sits above the first straddler is skipped. Once the
+            // window opened there is structure around the cut and a refusal
+            // is a real mismatch: it closes the window.
+            None => {
+                if window.is_empty() {
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let straddles = !left.is_empty() && !right.is_empty();
+        if straddles {
+            let largest = left
+                .iter()
+                .chain(&right)
+                .map(|s| s.size)
+                .fold(0.0f32, f32::max);
+            straddler_size = straddler_size.max(largest);
+            straddlers += 1;
+        } else if !window.is_empty() {
+            // A one-sided band after the window opened: a trailing continuation
+            // (the list's last items, a Session cell's wrapped line) only
+            // joins while its glyphs stay the size of the structure's.
+            let size = left
+                .iter()
+                .chain(&right)
+                .map(|s| s.size)
+                .fold(0.0f32, f32::max);
+            if size > straddler_size * TRAILING_SIZE_FACTOR {
+                break;
+            }
+        }
+
+        if !window.is_empty() || straddles {
+            window.push((index, left, right));
+        }
+    }
+
+    if window.is_empty() {
+        return None;
+    }
+    let start = window[0].0;
+    let end = window.last().expect("non-empty").0 + 1;
+    if straddlers < MIN_STRIP_STRADDLERS {
+        return None;
+    }
+
+    let mut left_pieces = 0usize;
+    let mut right_pieces = 0usize;
+    let mut left_min = f32::INFINITY;
+    let mut left_max = f32::NEG_INFINITY;
+    let mut right_min = f32::INFINITY;
+    let mut right_max = f32::NEG_INFINITY;
+    let mut content_min = f32::INFINITY;
+    let mut content_max = f32::NEG_INFINITY;
+    let mut size_max = 0.0f32;
+    let mut left_min_lefts: Vec<f32> = Vec::new();
+    let mut right_min_lefts: Vec<f32> = Vec::new();
+
+    for &(_, ref left, ref right) in &window {
+        if !left.is_empty() {
+            left_pieces += left.len();
+            let min_left = left.iter().map(|s| s.left).fold(f32::INFINITY, f32::min);
+            let max_right = left.iter().map(|s| s.right).fold(f32::NEG_INFINITY, f32::max);
+            left_min = left_min.min(min_left);
+            left_max = left_max.max(max_right);
+            content_min = content_min.min(min_left);
+            content_max = content_max.max(max_right);
+            size_max = size_max.max(left.iter().map(|s| s.size).fold(0.0f32, f32::max));
+            left_min_lefts.push(min_left);
+        }
+        if !right.is_empty() {
+            right_pieces += right.len();
+            let min_left = right.iter().map(|s| s.left).fold(f32::INFINITY, f32::min);
+            let max_right = right.iter().map(|s| s.right).fold(f32::NEG_INFINITY, f32::max);
+            right_min = right_min.min(min_left);
+            right_max = right_max.max(max_right);
+            content_min = content_min.min(min_left);
+            content_max = content_max.max(max_right);
+            size_max = size_max.max(right.iter().map(|s| s.size).fold(0.0f32, f32::max));
+            right_min_lefts.push(min_left);
+        }
+    }
+
+    if left_pieces.max(right_pieces) < MIN_STRIP_PIECES {
+        return None;
+    }
+
+    // Both sides carry a real share of the window's width — the account
+    // table's own internal gutter leaves 5.9% on the right and is refused
+    // here as well as by the overlap rule.
+    let total = content_max - content_min;
+    if !(total > 0.0) {
+        return None;
+    }
+    let left_share = (left_max - left_min) / total;
+    let right_share = (right_max - right_min) / total;
+    if left_share < MIN_STRIP_SHARE || right_share < MIN_STRIP_SHARE {
+        return None;
+    }
+
+    // Both sides line up band after band → a two-column structure read
+    // row-major. An anchor is the first band's minimum left; every band with
+    // that side filled must agree within part of its largest glyph.
+    let tolerance = run_tolerance(&bands[start..end]);
+    let left_anchor = side_anchor(&left_min_lefts, tolerance);
+    let right_anchor = side_anchor(&right_min_lefts, tolerance);
+
+    let plan = match (left_anchor, right_anchor) {
+        (Some(left), Some(right)) => StripPlan {
+            start,
+            end,
+            cut,
+            table: true,
+            columns: vec![left, right],
+        },
+        _ => StripPlan {
+            start,
+            end,
+            cut,
+            table: false,
+            columns: Vec::new(),
+        },
+    };
+    Some(plan)
+}
+
+/// The common left edge of a side whose bands all agree, or `None` where they
+/// drift beyond part of their largest glyph.
+fn side_anchor(min_lefts: &[f32], tolerance: f32) -> Option<f32> {
+    let first = *min_lefts.first()?;
+    (min_lefts
+        .iter()
+        .all(|left| (left - first).abs() <= tolerance))
+    .then_some(first)
+}
+
+/// Split one band at `cut`; `None` when the cut crosses ink it may not cut.
+fn split_band(band: &Band, cut: f32) -> Option<(Vec<Segment>, Vec<Segment>)> {
+    let mut left: Vec<Segment> = Vec::new();
+    let mut right: Vec<Segment> = Vec::new();
+
+    for segment in &band.segments {
+        if segment.right <= cut {
+            left.push(segment.clone());
+        } else if segment.left >= cut {
+            right.push(segment.clone());
+        } else {
+            // A full-width line was once refused outright — its word gaps
+            // are wide enough to carry any cut. The Session blocks measure
+            // the cost: page 4's 5.2 fused row spans [62.83, 534.47] =
+            // 471.64pt across the 457.9pt threshold and carries the cut
+            // inside its own (300.54, 10.16) gap, so the refusal threw away
+            // the strongest straddler its window has and every Session
+            // block reads as cross-read flow. cut_segment alone now guards
+            // the piece: the cut must land inside a ≥0.55 em gap of this
+            // segment with both pieces ≥ its minimum, monospace refuses,
+            // and the window still needs corroboration at evaluate_cut —
+            // ≥2 straddlers, ≥3 pieces per side, ≥12% shares and aligned
+            // anchors. A false window would need consecutive lines whose
+            // word gaps align within a point, which justified running text
+            // does not do.
+            let (left_piece, right_piece) = cut_segment(segment, cut)?;
+            if let Some(piece) = left_piece {
+                left.push(piece);
+            }
+            if let Some(piece) = right_piece {
+                right.push(piece);
+            }
+        }
+    }
+
+    // The cut may not leave overlapping ink inside one side. The marker cells
+    // at the account table's own gutter are the measured case: cut there, the
+    // `1` cell inside [372.72, 378.59] overlaps the list segment
+    // [60.62, 378.59] it hangs beside, because those cells have no independent
+    // existence on their side.
+    if overlaps_within(&left) || overlaps_within(&right) {
+        return None;
+    }
+
+    left.sort_by(|a, b| a.left.total_cmp(&b.left));
+    right.sort_by(|a, b| a.left.total_cmp(&b.left));
+    Some((left, right))
+}
+
+/// Whether any two segments of one side overlap horizontally.
+fn overlaps_within(segments: &[Segment]) -> bool {
+    let mut ordered: Vec<&Segment> = segments.iter().collect();
+    ordered.sort_by(|a, b| a.left.total_cmp(&b.left));
+    ordered
+        .windows(2)
+        .any(|pair| pair[0].right > pair[1].left + 0.25)
+}
+
+/// Apply a decided cut to a window's bands, folding both sides into each band
+/// left to right. Row-major reading follows from the ordinary machinery.
+fn apply_cut(bands: &mut [Band], start: usize, end: usize, cut: f32) {
+    for band in &mut bands[start..end] {
+        let (left, right) = match split_band(band, cut) {
+            Some(pieces) => pieces,
+            None => unreachable!("the band admitted this cut during evaluation"),
+        };
+        let mut segments = left;
+        segments.extend(right);
+        band.segments = segments;
+    }
+}
+
+/// Cut a fused segment through the recorded gap that contains `cut`, handing
+/// back (left piece, right piece).
+///
+/// `None` when the gap is too narrow for the column rule, when either side
+/// would be left slimmer than a short word — the footnote markers measure
+/// 5.87pt, the bar this sets — or when the cut lands inside a glyph, which no
+/// gap contains.
+fn cut_segment(segment: &Segment, cut: f32) -> Option<(Option<Segment>, Option<Segment>)> {
+    // Monospace text never carries: its constant advance repeats any space as
+    // a carrier-sized gap, and slicing a code line's trailing comment away is
+    // what builds the fake code|comment tables the reference does not have.
+    if monospace(segment) {
+        return None;
+    }
+    let &(gap_right, gap_width) = segment
+        .gaps
+        .iter()
+        .find(|&&(right, width)| right < cut && cut < right + width)?;
+    let minimum_piece = segment.size * MIN_CUT_PIECE_EM;
+    if gap_width < segment.size * CUT_MIN_GAP_EM
+        || gap_right - segment.left < minimum_piece
+        || segment.right - (gap_right + gap_width) < minimum_piece
+    {
+        return None;
+    }
+
+    // First character at or after the cut: everything before it stays left.
+    let mut boundary: Option<(usize, usize)> = None;
+    'outer: for (run_index, run) in segment.runs.iter().enumerate() {
+        for (char_index, &char_x) in run.x.iter().enumerate() {
+            if char_x >= cut {
+                boundary = Some((run_index, char_index));
+                break 'outer;
+            }
+        }
+    }
+    let Some((run_index, char_index)) = boundary else {
+        return None;
+    };
+
+    let mut left_runs: Vec<Run> = Vec::new();
+    let mut right_runs: Vec<Run> = Vec::new();
+    for (index, run) in segment.runs.iter().enumerate() {
+        if index < run_index {
+            left_runs.push(run.clone());
+        } else if index > run_index {
+            right_runs.push(run.clone());
+        } else {
+            let mut head = run.clone();
+            let mut tail = run.clone();
+            head.text = run.text.chars().take(char_index).collect();
+            head.x = run.x[..char_index].to_vec();
+            tail.text = run.text.chars().skip(char_index).collect();
+            tail.x = run.x[char_index..].to_vec();
+            if !head.text.is_empty() {
+                left_runs.push(head);
+            }
+            if !tail.text.is_empty() {
+                right_runs.push(tail);
+            }
+        }
+    }
+
+    trim_trailing_runs(&mut left_runs);
+    trim_leading_runs(&mut right_runs);
+    if left_runs.is_empty() || right_runs.is_empty() {
+        return None;
+    }
+
+    let left = Segment {
+        left: segment.left,
+        right: gap_right,
+        runs: left_runs,
+        gaps: segment
+            .gaps
+            .iter()
+            .copied()
+            .filter(|&(right, _)| right < gap_right)
+            .collect(),
+        ..segment.clone()
+    };
+    let right = Segment {
+        left: right_runs
+            .first()
+            .and_then(|run| run.x.first())
+            .copied()
+            .unwrap_or(gap_right + gap_width),
+        right: segment.right,
+        runs: right_runs,
+        gaps: segment
+            .gaps
+            .iter()
+            .copied()
+            .filter(|&(right, _)| right > gap_right)
+            .collect(),
+        ..segment.clone()
+    };
+    Some((Some(left), Some(right)))
+}
+
+/// Drop a run's leading spaces together with their recorded x positions.
+/// Keeping `x` parallel to `text` is the whole point: the analyser cuts
+/// segments through the recorded gaps, so a position must not survive its
+/// character.
+fn trim_leading_runs(runs: &mut Vec<Run>) {
+    while let Some(first) = runs.first_mut() {
+        let dropped =
+            first.text.chars().count() - first.text.trim_start_matches(' ').chars().count();
+        if dropped == 0 {
+            break;
+        }
+        for _ in 0..dropped {
+            first.x.remove(0);
+        }
+        first.text = first.text.trim_start_matches(' ').to_string();
+        if first.text.is_empty() {
+            runs.remove(0);
+        }
+    }
+}
+
+/// Drop a run's trailing spaces together with their recorded x positions.
+fn trim_trailing_runs(runs: &mut Vec<Run>) {
+    while let Some(last) = runs.last_mut() {
+        let dropped = last.text.chars().count() - last.text.trim_end_matches(' ').chars().count();
+        if dropped == 0 {
+            break;
+        }
+        for _ in 0..dropped {
+            last.x.pop();
+        }
+        last.text = last.text.trim_end_matches(' ').to_string();
+        if last.text.is_empty() {
+            runs.pop();
+        }
+    }
 }
 
 /// Emit a multi-column region in reading order: down each column in turn.
@@ -750,28 +1453,65 @@ fn strip_prefix(inlines: &[Inline], chars: usize) -> Vec<Inline> {
 /// tail — no table row begins part-way across — so it continues the cell above
 /// it, and the wrapped break becomes a space, exactly as a soft line break does
 /// in a paragraph.
-fn build_table(bands: &[Band], start: usize, end: usize, columns: &[f32]) -> Block {
+///
+/// The subset test fails when *every* cell of a row wraps: the continuation
+/// fills the same columns as the line above, and no shape distinguishes it from
+/// a second row. The producer's rulings carry that information, so a ruled table
+/// is grouped by them instead — a rule between two bands ends the row, and its
+/// absence means the bands belong together.
+fn build_table(
+    bands: &[Band],
+    start: usize,
+    end: usize,
+    columns: &[f32],
+    rules: &[Rule],
+) -> Block {
     let tolerance = run_tolerance(&bands[start..end]);
+    let internal = table_rules(bands, start, end, rules);
+    let ruled = internal.len() >= MIN_INTERNAL_RULES;
     let mut grouped: Vec<Vec<Vec<Inline>>> = Vec::new();
     let mut previous: Vec<usize> = Vec::new();
+    let mut upper: Option<&Band> = None;
 
     for band in &bands[start..end] {
         let matched = match_columns(&band.segments, columns, tolerance);
         let filled: Vec<usize> = matched.iter().flatten().copied().collect();
+        let subset = filled.iter().all(|column| previous.contains(column));
 
-        let wrapped = !grouped.is_empty()
-            && filled.len() < previous.len()
-            && filled.iter().all(|column| previous.contains(column));
+        let wrapped = match upper {
+            None => false,
+            // With rulings, absence of a rule between two bands is the producer
+            // saying they belong to one row. That is the only evidence that
+            // separates a row whose every cell wraps from two rows: both lines
+            // fill the same columns, so the subset test cannot.
+            Some(upper) if ruled => {
+                subset
+                    && !internal
+                        .iter()
+                        .any(|rule| rule.y < upper.bottom && rule.y > band.top)
+            }
+            // A table with no internal rulings still has wrapped cells: a tail
+            // band fills fewer columns than its row's first line.
+            Some(_) => filled.len() < previous.len() && subset,
+        };
 
         if !wrapped {
             grouped.push(vec![Vec::new(); columns.len()]);
         }
         previous = filled;
+        upper = Some(band);
 
         let row = grouped.last_mut().expect("a row exists");
-        for (segment, column) in band.segments.iter().zip(&matched) {
+        for (index, segment) in band.segments.iter().enumerate() {
+            // A segment on none of the columns is either litter or a cell
+            // whose own column start is behind it — the wrapped `fantôme` of
+            // `Lecture fantôme` (measured at x=155.79..199.81, page 2 of
+            // `TP2 Admin BD 2026_2027.pdf`) hangs entirely between the term
+            // column at 76.62 and the definition column at 206.67, and it is
+            // the term cell's second line, not a stray.
+            let column = matched[index].or_else(|| hang_column(segment, columns, tolerance));
             let Some(column) = column else { continue };
-            let cell = &mut row[*column];
+            let cell = &mut row[column];
             if !cell.is_empty() {
                 cell.push(Inline::text(" "));
             }
@@ -793,8 +1533,8 @@ fn build_table(bands: &[Band], start: usize, end: usize, columns: &[f32]) -> Blo
         })
         .collect();
 
-    // A first row that is entirely bold is a header. Everything else has to be
-    // inferred from ruling lines, which are not read yet.
+    // A first row that is entirely bold is a header. The rulings say where rows
+    // end; they do not say which row is a header.
     if bands[start].segments.iter().all(|s| s.bold) {
         if let Some(first) = rows.first_mut() {
             for cell in &mut first.cells {
@@ -809,6 +1549,60 @@ fn build_table(bands: &[Band], start: usize, end: usize, columns: &[f32]) -> Blo
         rows,
         borders: Default::default(),
     })
+}
+
+/// The rules that can bound a row of this table: inside its vertical extent and
+/// crossing at least [`RULE_COVERAGE`] of its text width.
+///
+/// A border above the first band or below the last is not inside and is
+/// excluded — those are the table's own top and bottom edges, not row
+/// boundaries. A rule that covers only a fraction of the width is one cell's
+/// border in a table that does not rule every column, and is not trusted to say
+/// where a row ends.
+fn table_rules<'a>(bands: &[Band], start: usize, end: usize, rules: &'a [Rule]) -> Vec<&'a Rule> {
+    let left = bands[start..end]
+        .iter()
+        .flat_map(|band| &band.segments)
+        .map(|segment| segment.left)
+        .fold(f32::INFINITY, f32::min);
+    let right = bands[start..end]
+        .iter()
+        .flat_map(|band| &band.segments)
+        .map(|segment| segment.right)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let width = right - left;
+    let top = bands[start].top;
+    let bottom = bands[end - 1].bottom;
+
+    rules
+        .iter()
+        .filter(|rule| rule.y < top && rule.y > bottom)
+        .filter(|rule| {
+            let overlap = rule.x1.min(right) - rule.x0.max(left);
+            overlap >= width * RULE_COVERAGE
+        })
+        .collect()
+}
+
+/// The column a hanging continuation belongs to: entirely between the column
+/// at its left and the next one (or beyond the last column, where nothing
+/// bounds it). Returns `None` where no such column exists, which leaves the
+/// segment dropped exactly as before.
+fn hang_column(segment: &Segment, columns: &[f32], tolerance: f32) -> Option<usize> {
+    let mut position: Option<usize> = None;
+    for (index, column) in columns.iter().enumerate() {
+        if segment.left > column + tolerance {
+            position = Some(index);
+        }
+    }
+    let position = position?;
+    match columns.get(position + 1) {
+        // Between two columns: the continuation must not reach into the next
+        // one's start.
+        Some(&next) => (segment.right < next).then_some(position),
+        // Past the last column: the last cell's own continuation.
+        None => Some(position),
+    }
 }
 
 fn segment_inlines(segment: &Segment) -> Vec<Inline> {
@@ -917,6 +1711,66 @@ mod tests {
         ir::PageSetup::default()
     }
 
+    /// One styled run, with the per-character positions `Run` carries.
+    fn run(text: &str, left: f32, size: f32, bold: bool) -> Run {
+        Run {
+            text: text.to_string(),
+            x: (0..text.chars().count())
+                .map(|index| left + index as f32 * size * 0.5)
+                .collect(),
+            bold,
+            italic: false,
+            size,
+            font: None,
+            vertical: Default::default(),
+        }
+    }
+
+    /// A segment at an explicit page position. `build_table` reads its left
+    /// edge, its extent and its text; the run's own x list only matters to the
+    /// cut pass, which these tests bypass.
+    fn segment(text: &str, left: f32, bottom: f32, size: f32, bold: bool) -> Segment {
+        Segment {
+            runs: vec![run(text, left, size, bold)],
+            left,
+            right: left + text.chars().count() as f32 * size * 0.5,
+            bottom,
+            top: bottom + size,
+            size,
+            bold,
+            italic: false,
+            gaps: Vec::new(),
+        }
+    }
+
+    fn band(bottom: f32, top: f32, segments: Vec<Segment>) -> Band {
+        Band {
+            segments,
+            bottom,
+            top,
+        }
+    }
+
+    fn rule(x0: f32, x1: f32, y: f32) -> Rule {
+        Rule {
+            x0,
+            x1,
+            y,
+            thickness: 0.4,
+        }
+    }
+
+    fn cell_text(cell: &TableCell) -> String {
+        cell.blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Paragraph { content, .. } => Some(ir::inlines_to_plain_text(content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn body_size_ignores_a_single_oversized_glyph() {
         // 40 characters of 11pt body text plus one 14pt bullet.
@@ -946,7 +1800,7 @@ mod tests {
         assert_eq!(profile.body_size, 11.0);
         assert_eq!(profile.heading_sizes, vec![16.0, 14.0]);
 
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
         assert!(matches!(blocks[0], Block::Heading { level: 1, .. }));
         assert!(matches!(blocks[1], Block::Heading { level: 2, .. }));
         assert!(matches!(blocks[2], Block::Paragraph { .. }));
@@ -958,7 +1812,7 @@ mod tests {
         glyphs.extend(line("et continue sur la ligne suivante.", 11.0, 88.0, 0.0, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         let Block::Paragraph { content, .. } = &blocks[0] else {
@@ -983,7 +1837,7 @@ mod tests {
         glyphs.extend(line(&short, 11.0, 52.0, 0.0, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         // Two paragraphs, the break falling after each short line. The short
         // line belongs to the paragraph it ends, not to the next one.
@@ -1008,7 +1862,7 @@ mod tests {
         glyphs.extend(line("• Durabilité", 11.0, 76.0, 0.0, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         let Block::List(list) = &blocks[0] else {
@@ -1050,7 +1904,7 @@ mod tests {
         }
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         let Block::Table(table) = &blocks[0] else {
@@ -1073,7 +1927,7 @@ mod tests {
         }
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert!(
             !blocks.iter().any(|b| matches!(b, Block::Table(_))),
@@ -1122,7 +1976,7 @@ mod tests {
         glyphs.extend(line("cohérent.", 11.0, 547.43, 186.65, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert_eq!(blocks.len(), 1, "{blocks:#?}");
         let Block::Table(table) = &blocks[0] else {
@@ -1158,7 +2012,7 @@ mod tests {
         glyphs.extend(line("(numérique sur 5 chiffres, clé primaire)", 11.0, 702.0, 78.62, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert!(
             !blocks.iter().any(|b| matches!(b, Block::Table(_))),
@@ -1192,11 +2046,433 @@ mod tests {
         glyphs.extend(line("Rappel : la lecture sale n'est jamais possible sous Oracle.", 11.0, 620.45, 42.62, false));
 
         let (bands, profile) = document_of(vec![glyphs]);
-        let blocks = build_page(&bands[0], &profile, &page());
+        let blocks = build_page(&bands[0], &[], &profile, &page());
 
         assert!(
             !blocks.iter().any(|b| matches!(b, Block::Table(_))),
             "a two-column layout must not read as a table: {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn a_full_width_fused_row_is_cut_at_its_own_gap() {
+        // Page 4's 5.2 block, measured: the header band carries Session A at
+        // 61.83 and Session B at 310.70; beneath it the row
+        // "[A1] Interrogez le solde du compte n°2 (dans une" runs to 300.54
+        // and "[B1] Augmentez le solde du compte n°2 de 500" starts at
+        // 310.70 — a 10.16pt carrier gap inside ONE fused segment whose
+        // 471.64pt span crosses the full-width threshold (457.9). The
+        // full-width refusal that used to sit before cut_segment threw the
+        // row away and with it the window's strongest straddler; the cut has
+        // to split it at the recorded gap instead. The helper's fixed glyph
+        // widths render the same prose wider than the document's font, so
+        // the left cell here ends at 342.23 and the right cell starts
+        // 10.16pt later — the gap width, the full-width span (477.56 ≥
+        // 457.9) and the cell origins are the measured ones, cut now
+        // 347.31.
+        let mut glyphs = Vec::new();
+        let right_cell = 352.39; // left cell ends 342.23, carrier gap 10.16
+        glyphs.extend(line("Session A", 11.0, 730.0, 61.83, true));
+        glyphs.extend(line("Session B", 11.0, 730.0, right_cell, true));
+        glyphs.extend(
+            line("[A1] Interrogez le solde du compte n°2 (dans une", 11.0, 716.0, 62.83, false),
+        );
+        glyphs.extend(line("[B1] Augmentez le solde du compte", 11.0, 716.0, right_cell, false));
+        glyphs.extend(line("transaction que vous laissez ouverte,", 11.0, 702.0, 62.83, false));
+        glyphs.extend(line("DT.", 11.0, 702.0, right_cell, false));
+        glyphs.extend(line("[B2] Validez la transaction.", 11.0, 688.0, right_cell, false));
+        glyphs.extend(line("[A2] Réinterrogez le solde du compte n°2,", 11.0, 674.0, 62.83, false));
+        glyphs.extend(line("même transaction qu'en [A1].", 11.0, 660.0, 62.83, false));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &[], &profile, &page());
+
+        let table = blocks.iter().find_map(|block| match block {
+            Block::Table(table) => Some(table),
+            _ => None,
+        });
+        let Some(table) = table else {
+            panic!("the Session block never read as a table: {blocks:#?}");
+        };
+        assert!(table.column_count() >= 2, "{blocks:#?}");
+        // The fused row split: its two halves sit in different cells of the
+        // same row rather than flowing together.
+        let cells = table
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .map(|cell| {
+                cell.blocks
+                    .iter()
+                    .map(|block| match block {
+                        Block::Paragraph { content, .. } => content
+                            .iter()
+                            .map(|inline| match inline {
+                                Inline::Text(text) => text.text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect::<String>(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            cells.contains("[A1] Interrogez le solde du compte n°2 (dans une")
+                && cells.contains("[B1] Augmentez le solde du compte"),
+            "the fused row's halves must land in separate cells: {cells}"
+        );
+        assert!(
+            cells.contains("[B2] Validez la transaction.") && cells.contains("[A2]"),
+            "the one-sided continuation rows must feed the table: {cells}"
+        );
+    }
+
+    #[test]
+    fn two_tiered_session_blocks_yield_two_tables() {
+        // Page 4 of `TP2 Admin BD 2026_2027.pdf` stacks the 5.1 and 5.2
+        // Session blocks. Each fused row carries its own cut (5.1's inside a
+        // 13.14pt carrier gap, measured cut 298.72; 5.2's inside a 10.16pt
+        // one, measured cut 305.62) and the Question line between them
+        // crosses both with word gaps of 1.1pt against a 6.05pt minimum,
+        // which is the wall that closes each walk. Recording the wider 5.2
+        // window first used to shadow the narrower 5.1 window: the scans
+        // never came back — widest-wins lost the upper table. The scan now
+        // adopts the earliest-opening window, so both fire, in page order.
+        // Helper glyph widths squeeze the prose; cell origins, carrier-gap
+        // widths and block pitches are the measured ones.
+        let mut glyphs = Vec::new();
+        // --- the 5.1 block: header, fused row at cut 315.70 (13.14pt gap),
+        // then the left-only continuation rows that corroborate it.
+        glyphs.extend(line("Session A", 11.0, 740.0, 77.03, true));
+        glyphs.extend(line("Session B", 11.0, 740.0, 322.27, true));
+        glyphs.extend(line("[A1] Modifiez (sans valider) le solde du", 11.0, 726.0, 77.03, false));
+        glyphs.extend(line("[B1] Interrogez le solde du compte", 11.0, 726.0, 322.27, false));
+        glyphs.extend(line("pour lui donner la valeur 9999.", 11.0, 712.0, 77.03, false));
+        glyphs.extend(line("[A2] Annulez la transaction.", 11.0, 698.0, 77.03, false));
+        // --- the wall: a full-width question line whose word gaps carry no
+        // cut, refusing every candidate and closing both windows' walks.
+        glyphs.extend(
+            line("Quelle valeur voit la Session B en [B1] ? Est-ce 9999 ou 1000 ?", 11.0, 684.0, 60.42, false),
+        );
+        // --- the 5.2 block: header, fused row at cut 347.31 (10.16pt gap,
+        // full-width span), wrap row, then the one-sided continuations.
+        let right_cell = 352.39;
+        glyphs.extend(line("Session A", 11.0, 670.0, 61.83, true));
+        glyphs.extend(line("Session B", 11.0, 670.0, right_cell, true));
+        glyphs.extend(
+            line("[A1] Interrogez le solde du compte n°2 (dans une", 11.0, 656.0, 62.83, false),
+        );
+        glyphs.extend(line("[B1] Augmentez le solde du compte", 11.0, 656.0, right_cell, false));
+        glyphs.extend(line("transaction que vous laissez ouverte,", 11.0, 642.0, 62.83, false));
+        glyphs.extend(line("DT.", 11.0, 642.0, right_cell, false));
+        glyphs.extend(line("[B2] Validez la transaction.", 11.0, 628.0, right_cell, false));
+        glyphs.extend(line("[A2] Réinterrogez le solde du compte n°2,", 11.0, 614.0, 62.83, false));
+        glyphs.extend(line("même transaction qu'en [A1].", 11.0, 600.0, 62.83, false));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &[], &profile, &page());
+
+        let tables = blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Table(_)))
+            .count();
+        assert_eq!(tables, 2, "both Session blocks must be tables: {blocks:#?}");
+        let text = blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph { content, .. } => content
+                    .iter()
+                    .map(|inline| match inline {
+                        Inline::Text(text) => text.text.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("Quelle valeur voit la Session B"),
+            "the question line stays flow, not table: {blocks:#?}"
+        );
+        // The first table is the 5.1 block — the window whose start sits
+        // nearest the scan — and it keeps its own split fused row.
+        let first = blocks.iter().find_map(|block| match block {
+            Block::Table(table) => Some(table),
+            _ => None,
+        });
+        let cells = first
+            .expect("a table was counted above")
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .map(|cell| {
+                cell.blocks
+                    .iter()
+                    .map(|block| match block {
+                        Block::Paragraph { content, .. } => content
+                            .iter()
+                            .map(|inline| match inline {
+                                Inline::Text(text) => text.text.clone(),
+                                _ => String::new(),
+                            })
+                            .collect::<String>(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            cells.contains("[A1] Modifiez (sans valider)") && cells.contains("[B1] Interrogez"),
+            "the upper block's fused row split into cells: {cells}"
+        );
+    }
+
+    #[test]
+    fn every_cell_wrapping_merges_when_no_rule_separates_the_lines() {
+        // Page 2 of `TP2 Admin BD 2026_2027.pdf`, at the reader's own measured
+        // band extents and the rulings `rules::extract` reports. All three rows
+        // wrap both cells, so the subset test sees line 2 filling the same two
+        // columns as line 1 and calls it a row. The internal rules sit at
+        // 710.77 and 677.37; the top (757.57) and bottom (643.95) edges are
+        // outside the text and must not count as row boundaries.
+        let bands = vec![
+            band(
+                741.67,
+                755.10,
+                vec![
+                    segment("Lecture non répétable", 76.62, 741.67, 11.0, false),
+                    segment(
+                        "Une transaction relit une même ligne et obtient une valeur",
+                        206.67,
+                        741.67,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+            band(
+                728.28,
+                741.71,
+                vec![
+                    segment("(Non-Repeatable Read)", 76.62, 728.28, 11.0, false),
+                    segment(
+                        "différente car une autre transaction l'a modifiée et validée entre",
+                        206.67,
+                        728.28,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+            band(
+                714.87,
+                728.30,
+                vec![segment("temps.", 206.67, 714.87, 11.0, false)],
+            ),
+            band(
+                694.87,
+                708.30,
+                vec![
+                    segment("Lecture", 76.62, 694.87, 11.0, true),
+                    segment("fantôme", 155.79, 694.87, 11.0, true),
+                    segment(
+                        "Une transaction ré-exécute une requête avec condition (WHERE) et",
+                        206.67,
+                        694.87,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+            band(
+                681.47,
+                694.90,
+                vec![
+                    segment("(Phantom Read)", 76.62, 681.47, 11.0, true),
+                    segment(
+                        "obtient un ensemble de lignes différent.",
+                        206.67,
+                        681.47,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+            band(
+                661.45,
+                674.88,
+                vec![
+                    segment("Mise à jour perdue (Lost", 76.62, 661.45, 11.0, false),
+                    segment(
+                        "Deux transactions lisent puis écrivent la même donnée ; la",
+                        206.67,
+                        661.45,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+            band(
+                648.05,
+                661.48,
+                vec![
+                    segment("Update)", 76.62, 648.05, 11.0, true),
+                    segment(
+                        "seconde écriture écrase la première sans en tenir compte.",
+                        206.67,
+                        648.05,
+                        11.0,
+                        false,
+                    ),
+                ],
+            ),
+        ];
+        let rules = [
+            rule(72.22, 523.38, 757.57),
+            rule(72.22, 523.38, 710.77),
+            rule(72.22, 523.38, 677.37),
+            rule(72.22, 523.38, 643.95),
+        ];
+
+        let Block::Table(table) =
+            build_table(&bands, 0, bands.len(), &[76.62, 206.67], &rules)
+        else {
+            panic!("expected a table");
+        };
+
+        assert_eq!(table.rows.len(), 3, "{table:#?}");
+        assert_eq!(
+            cell_text(&table.rows[0].cells[0]),
+            "Lecture non répétable (Non-Repeatable Read)"
+        );
+        assert_eq!(
+            cell_text(&table.rows[0].cells[1]),
+            "Une transaction relit une même ligne et obtient une valeur différente car une autre transaction l'a modifiée et validée entre temps."
+        );
+        assert_eq!(
+            cell_text(&table.rows[1].cells[0]),
+            "Lecture fantôme (Phantom Read)"
+        );
+        assert_eq!(
+            cell_text(&table.rows[2].cells[0]),
+            "Mise à jour perdue (Lost Update)"
+        );
+    }
+
+    #[test]
+    fn a_ruled_one_sided_row_does_not_merge_into_the_row_above() {
+        // Page 4's 5.2 block, measured: `[B2] Validez la transaction.` is a
+        // right-only band below a row whose every cell wraps (`transaction que
+        // vous laissez ouverte,` | `DT.`). Without rulings the subset test
+        // merges it into the row above, which is how `[B2]` used to land in the
+        // A1/B1 row. The rules at 502.01 and 476.01 say it is a row of its own.
+        let bands = vec![
+            band(
+                507.93,
+                520.87,
+                vec![
+                    segment(
+                        "transaction que vous laissez ouverte,",
+                        62.83,
+                        507.93,
+                        10.5,
+                        false,
+                    ),
+                    segment("DT.", 310.70, 507.93, 10.5, false),
+                ],
+            ),
+            band(
+                482.82,
+                496.25,
+                vec![segment(
+                    "[B2] Validez la transaction.",
+                    310.70,
+                    482.82,
+                    10.5,
+                    false,
+                )],
+            ),
+            band(
+                456.82,
+                470.25,
+                vec![segment(
+                    "[A2] Réinterrogez le solde du compte n°2,",
+                    62.83,
+                    456.82,
+                    10.5,
+                    false,
+                )],
+            ),
+        ];
+        let rules = [rule(57.03, 538.58, 502.01), rule(57.03, 538.58, 476.01)];
+
+        let Block::Table(table) =
+            build_table(&bands, 0, bands.len(), &[62.83, 310.70], &rules)
+        else {
+            panic!("expected a table");
+        };
+
+        assert_eq!(table.rows.len(), 3, "{table:#?}");
+        assert_eq!(
+            cell_text(&table.rows[1].cells[1]),
+            "[B2] Validez la transaction."
+        );
+        assert_eq!(
+            cell_text(&table.rows[2].cells[0]),
+            "[A2] Réinterrogez le solde du compte n°2,"
+        );
+    }
+
+    #[test]
+    fn a_header_rule_alone_does_not_license_merging() {
+        // A printed table that rules only its header: one internal rule, no
+        // rules between the body rows. Trusting absence there would merge every
+        // body row into one, so one internal rule is never enough.
+        let bands = vec![
+            band(
+                640.0,
+                651.0,
+                vec![
+                    segment("Propriété", 76.62, 640.0, 11.0, true),
+                    segment("Définition", 206.67, 640.0, 11.0, true),
+                ],
+            ),
+            band(
+                620.0,
+                631.0,
+                vec![
+                    segment("Atomicité", 76.62, 620.0, 11.0, false),
+                    segment("Tout ou rien", 206.67, 620.0, 11.0, false),
+                ],
+            ),
+            band(
+                600.0,
+                611.0,
+                vec![
+                    segment("Cohérence", 76.62, 600.0, 11.0, false),
+                    segment("État valide", 206.67, 600.0, 11.0, false),
+                ],
+            ),
+            band(
+                580.0,
+                591.0,
+                vec![
+                    segment("Durabilité", 76.62, 580.0, 11.0, false),
+                    segment("Effet persistant", 206.67, 580.0, 11.0, false),
+                ],
+            ),
+        ];
+        let rules = [rule(72.22, 523.38, 635.0)];
+
+        let Block::Table(table) =
+            build_table(&bands, 0, bands.len(), &[76.62, 206.67], &rules)
+        else {
+            panic!("expected a table");
+        };
+
+        assert_eq!(table.rows.len(), 4, "{table:#?}");
     }
 }

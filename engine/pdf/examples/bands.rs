@@ -1,25 +1,28 @@
 //! Print the bands and segments a page produces, with the geometry behind them.
 //!
-//!     cargo run -p dconv-pdf --example bands -- <file.pdf> [page] [--glyphs]
+//!     cargo run -p dconv-pdf --example bands -- <file.pdf> [page] [--glyphs] [--rules]
 //!
 //! Exists because "this text came out in the wrong order" is the single most
 //! common thing to investigate, and the answer is always in the geometry that
 //! *our* bander saw. Reading that geometry back out of a second library
 //! reintroduces exactly the assumptions under test, so this prints the
-//! intermediate structure directly.
+//! intermediate structure directly. `--rules` prints the ruling lines the table
+//! builder consults, because a row boundary that reads wrong is usually a rule
+//! that was missed or merged into its neighbour.
 
-use dconv_pdf::{bind, glyph, layout};
+use dconv_pdf::{bind, glyph, layout, rules};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut positional = args.iter().filter(|arg| !arg.starts_with("--"));
-    let path = positional.next().ok_or("usage: bands <pdf> [page] [--glyphs]")?;
+    let path = positional.next().ok_or("usage: bands <pdf> [page] [--glyphs] [--rules]")?;
     let index: usize = match positional.next() {
         Some(value) => value.parse()?,
         None => 0,
     };
     let show_glyphs = args.iter().any(|arg| arg == "--glyphs");
+    let show_rules = args.iter().any(|arg| arg == "--rules");
 
     let pdfium = bind::bind()?;
     let document = pdfium.load_pdf_from_file(Path::new(path), None)?;
@@ -50,6 +53,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         println!();
+    }
+
+    if show_rules {
+        let rules = rules::extract(&page);
+        println!("\n-- rules ({}) --", rules.len());
+        for rule in &rules {
+            println!(
+                "  x={:7.2}..{:7.2}  y={:7.2}  thickness={:.2}",
+                rule.x0, rule.x1, rule.y, rule.thickness
+            );
+        }
     }
 
     for (i, band) in layout::analyse_page(&extraction.glyphs, space_em)

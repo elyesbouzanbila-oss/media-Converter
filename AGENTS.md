@@ -6,64 +6,26 @@ measurements behind them.
 
 ---
 
-## TL;DR
-
-- **Two owners, two directories.** The engine lives in `engine/`, the GUI lives in
-  `app/`. Never edit across that line.
-- The engine works: `dconv file.pdf` produces a real `.docx` at **1.28 % word
-  error** on the primary test document. Everything is committed and 100 tests
-  pass.
-- **The executables ship self-sufficient.** `pdfium.dll` is embedded in each one
-  and unpacked into a version-keyed cache on first run, so one file runs on a
-  machine that has never seen PDFium; `scripts/package.ps1` assembles the
-  deliverable and puts the licence texts beside it. Measured end to end, not
-  argued — but it is a property of a build made *after* the fetch, which cargo
-  does not arrange by itself; see [the single-file check](#checking-the-single-file-claim).
-- **Conversion is byte-for-byte reproducible, and that is now asserted.** Seven
-  committed fixtures under `tests/fixtures/synthetic/` are converted end to end
-  and checked against a committed `.docx` each, so a fresh clone can run a real
-  end-to-end test. The *fidelity percentages* are the part that still needs the
-  gitignored private documents.
-- **The GUI converts.** The egui/eframe shell runs the real facade through a
-  pool of worker *processes*; the demo pool is kept one swap away for
-  PDFium-free UI review. The UI's format list comes from the facade's
-  capability query — the last hand-written mirror is an exhaustive
-  facade→UI mapping that fails to compile on a new facade format — and
-  `app/tests/worker_golden.rs` runs a real worker child over the committed
-  fixtures and asserts byte equality with the goldens. See
-  [the GUI section](#the-gui-app).
-- **The CLI has a pool too**, and it is where the CLI half of the
-  byte-identical claim is asserted: `dconv -j 4 *.pdf` re-runs this same
-  executable as four workers, and `engine/cli/tests/pool.rs` converts every
-  fixture serially and in a pool and
-  compares with each other *and* with the committed goldens.
-- The real test PDFs are **gitignored**. Reproducing the numbers below needs
-  somebody to drop the documents into `tests/fixtures/private/`.
-- `docs/phase0-findings.md` is the decision record. Read the findings before
-  touching the layout analyser — most of its odd-looking constants exist because a
-  real document contradicted a plausible guess.
-
----
-
 ## The one rule that matters: two owners, two directories
 
-This repository was built by two agents working in parallel, and the directory
-split is the whole safety mechanism:
+This repository is built as two lanes working in parallel, and the directory
+split is the safety mechanism:
 
 | Owner | Directory | Crate / binary |
 | --- | --- | --- |
-| Engine | `engine/**` | `dconv-*`, binary `dconv` |
+| Engine | `engine/**` | `dconv-*`, binary `dconv` (CLI) |
 | GUI | `app/**` | `dconv-app`, binary `dconvert` |
 
 **Do not edit the other side's directory.** Not "be careful" — don't open the
-files. The only shared surfaces are the workspace manifest, `docs/`, `scripts/`,
-and the published API of `dconv-engine`. If you need something from the other
-side, change the *contract* and say so; do not reach in.
+files. The only shared surfaces are the workspace manifest, `docs/`,
+`scripts/`, and the published API of `dconv-engine`. If you need something from
+the other side, change the *contract* and say so; do not reach in.
 
 The GUI is deliberately **not** matched by a glob in `Cargo.toml`
 (`members = ["engine/*", "spikes/*", "app"]`). Cargo resolves every glob match
 into a package, so a half-created UI directory would have broken the engine's
-build. That is why the member list is explicit.
+build. That is why the member list is explicit, and why you should not convert
+`app` to the glob.
 
 ---
 
@@ -72,22 +34,34 @@ build. That is why the member list is explicit.
 ```
 engine/
   ir/          dconv-ir        the Doc IR: the contract between reader and writer
-  pdf/         dconv-pdf       PDFium binding, glyph extraction, layout analysis;
-                              build.rs embeds the vendored library in the binary
+  pdf/         dconv-pdf       PDFium binding, glyph and ruling extraction, layout
+                               analysis; build.rs embeds the vendored library in
+                               the binary
   docx/        dconv-docx      the writer (hand-built zip + XML)
   convert/     dconv-engine    the facade the CLI and GUI both call
   cli/         dconv-cli       the `dconv` binary
 app/           dconv-app       the egui/eframe GUI, binary `dconvert`  (UI owner)
 spikes/        pdf-extract, typst-pdf, pdf-pool   Phase 0 throwaway experiments
 scripts/       fetch-pdfium.ps1, package.ps1, make_fixtures.py, compare_*.py,
-               validate_docx.py
+               validate_docx.py, cpu-scale.py
 docs/          phase0-findings.md   the decision record
-third_party/   pdfium/    (gitignored; fetched by script)
-tests/fixtures/synthetic/ (committed) the fixtures, each with a golden .docx
-tests/fixtures/private/   (gitignored) the real documents — the only source of
-                          the fidelity numbers below
-out/           (gitignored; scratch conversion output)
+tests/fixtures/generate_fixtures.py     spike fixture generator (Python, no deps)
+tests/fixtures/generated/  (committed)  four fixtures the *spikes* use; perf.pdf
+                                        is the 100-page throughput-benchmark input
+tests/fixtures/synthetic/  (committed)  seven fixtures, each with a golden .docx
+tests/fixtures/private/    (gitignored) the real documents — the only source of
+                                        the fidelity numbers below
+third_party/pdfium/        packaging metadata (VERSION, licenses/) is committed;
+                           bin/, lib/, include/ are gitignored, fetched by script
+out/, dist/, target/       gitignored scratch
 ```
+
+Two fixture sets by two generators — don't mix them up:
+
+- `scripts/make_fixtures.py` → `synthetic/`: what `dconv-engine`'s golden test
+  converts and what byte-reproducibility is pinned against (needs PyMuPDF).
+- `tests/fixtures/generate_fixtures.py` → `generated/`: baseline/perf input for
+  the Phase 0 `spikes/` only, dependency-free by design.
 
 `spikes/` is history, not code to build on. They answered their questions; the
 findings are what survived.
@@ -100,9 +74,10 @@ findings are what survived.
 cargo build  --profile spike            # whole workspace
 cargo test   --profile spike            # whole workspace, 100 tests
 cargo build  -p dconv-cli --profile spike
-target\spike\dconv.exe --help
+target\spike\dconv.exe --help           # CLI; dconvert.exe is the GUI
 
 .\scripts\package.ps1                   # dist\: both executables + LICENSES\
+.\scripts\package.ps1 -Profile spike -SkipBuild   # assemble only (what CI runs)
 ```
 
 Two release profiles, and the distinction matters for iteration speed:
@@ -121,10 +96,10 @@ Bootstrap PDFium once — it is gitignored:
 .\scripts\fetch-pdfium.ps1
 ```
 
-`engine/pdf/src/bind.rs` has `PDFIUM_VERSION = "8100"`, and this script is the
-source of truth for it. Keep them in step; `pdfium-render 0.9.4` generates
-bindings for the `chromium/7881` API, so newer drops are a safe superset and older
-ones are not.
+`engine/pdf/src/bind.rs` has `PDFIUM_VERSION = "8100"`, and the script (via the
+committed `third_party/pdfium/VERSION`) is the source of truth for it. Keep them
+in step; `pdfium-render 0.9.4` generates bindings for the `chromium/7881` API, so
+newer drops are a safe superset and older ones are not.
 
 **Order matters for the deliverable.** The fetch has to happen before the build
 that ships, because `engine/pdf/build.rs` embeds the vendored library only if it
@@ -132,55 +107,70 @@ is there when the crate is compiled; a tree built without it still compiles, but
 the binary carries nothing and will need a `pdfium.dll` next to it.
 
 The order is not enforced by cargo, and the case worth knowing about is a fetch
-made *after* a build. Cargo decides whether to re-run a build script by comparing
-the watched file's timestamp against the last build's, and `tar` restores the
-archive's timestamps — so a library the fetch script has just vendored is *older*
-than the build it has to invalidate, and the build after it still carries nothing.
-Silently. Two things catch it, both measured rather than assumed: the fetch script
-touches `engine/pdf/build.rs` and the library itself, dirtying the crate as a
-source change cargo cannot miss; and `what_ships_is_the_library_every_test_binds_to`
-fails, with the fix in the message, when the vendored library is on disk while
-this build carries no copy of it. Vendoring PDFium by hand is the one path that
-does neither — touch `engine/pdf/build.rs` or run `cargo clean -p dconv-pdf`
-before building a release.
+made *after* a build: cargo compares the watched file's timestamp against the
+last build's, and `tar` restores the archive's timestamps — so a library the
+fetch script has just vendored is *older* than the build it has to invalidate,
+and the build after it still carries nothing. Silently. Two things catch it,
+both measured: the fetch script touches `engine/pdf/build.rs` and the library
+itself, dirtying the crate as a source change cargo cannot miss; and
+`what_ships_is_the_library_every_test_binds_to` fails, with the fix in the
+message, when the vendored library is on disk while this build carries no copy
+of it. Vendoring PDFium by hand is the one path that does neither — touch
+`engine/pdf/build.rs` or run `cargo clean -p dconv-pdf` before building a
+release.
 
 ### Checking the single-file claim
 
-What the tests cannot assert is that the *program* still works with no library on
-disk anywhere: every bind on this machine finds the vendored copy first. (The
+What the tests cannot assert is that the *program* still works with no library
+on disk anywhere: every bind on this machine finds the vendored copy first. (The
 bytes are asserted — that is the seven tests in `bind.rs`.) Two things cover the
 rest.
 
-`scripts/package.ps1` assembles the deliverable and refuses to finish unless each
-executable *contains* the vendored library's bytes — an ordinal search over 17 MB
-rather than a hash, because the library is inside the file and there is no second
-file to hash. That runs against the release build, which is stripped, so it is
-also what checks that stripping did not take the embed with it.
+`scripts/package.ps1` assembles the deliverable and refuses to finish unless
+each executable *contains* the vendored library's bytes — an ordinal search over
+17 MB rather than a hash, because the library is inside the file and there is no
+second file to hash. That runs against the release build, which is stripped, so
+it is also what checks that stripping did not take the embed with it.
 
 The runtime claim is a procedure, run when it matters (a release, or a change to
 `bind.rs`):
 
 1. Rename `third_party/pdfium/bin/pdfium.dll` aside, and delete
-   `%LOCALAPPDATA%\docconvert\pdfium\8100\` if it exists — the two ways the
-   library could still be found on disk.
-2. Copy `target\spike\dconv.exe` (or the release build) into an empty directory of
-   its own, with no other file in it.
+   `%LOCALAPPDATA%\docconvert\pdfium\8100\` if it exists.
+2. Copy `target\spike\dconv.exe` into an empty directory of its own.
 3. Run it over any fixture from there. It must convert, and it must leave a
-   `pdfium.dll` in the cache directory, byte-identical to the one that was
-   renamed aside.
-4. Run it again: the second run must not rewrite the cached copy, because the
-   cache is one of the searched directories and a hit skips unpacking entirely.
+   `pdfium.dll` in the version-keyed cache, byte-identical to the one renamed
+   aside.
+4. Run it again: the second run must not rewrite the cached copy.
 5. Put the vendored library back — and do not rebuild while it is aside, since a
    build in that window is a build with no embedded copy.
 
-Step 3's output is worth diffing against the committed golden while the tree is in
-that state: a converter that unpacks its library correctly and a converter that
-converts correctly are two different claims.
+Step 3's output is worth diffing against the committed golden while the tree is
+in that state: a converter that unpacks its library correctly and a converter
+that converts correctly are two different claims.
 
-What is *asserted* is the part with no environment in it: the bytes this build
-carries are the vendored library's, byte for byte; unpacking is idempotent, repairs
-a damaged cache copy, replaces one left by a different build, and tolerates four
-threads doing it at once. Those are the seven tests in `bind.rs`.
+---
+
+## CI (`.github/workflows/ci.yml`)
+
+One Windows job on every push to `main` and every PR: fetch PDFium → `cargo
+build/test --workspace --profile spike --locked` → `git diff --exit-code`
+against `tests/fixtures/synthetic` (the goldens must be untouched — `DCONV_BLESS`
+is never set in CI, so an accidental or unread re-bless fails here) →
+`package.ps1 -Profile spike -SkipBuild` with the embed assertion → every
+`dist/LICENSES/` file hash-checked against its upstream copy.
+
+Deliberately not gated: `cargo fmt --check` and `cargo clippy -D warnings`.
+Neither is clean in the tree today, and turning them on would mean reformatting
+across the engine/app ownership line — the workflow header says so. Do not
+"helpfully" run them tree-wide; do it lane-local if at all, and don't add lint
+gates to CI as a drive-by.
+
+`--locked` means a dependency change breaks CI unless `Cargo.lock` is committed
+with it.
+
+There is no installer and no automated release; `package.ps1` is the whole
+release process.
 
 ---
 
@@ -201,16 +191,18 @@ paragraphs: it has glyphs at coordinates. `dconv-pdf` therefore goes:
 2. `layout.rs` — group glyphs into **bands** (one visual baseline) and split each
    band into **segments** (runs separated by a column-sized gap).
 3. `analyze.rs` — classify bands into paragraphs, headings, lists and tables, and
-   build IR blocks.
+   build IR blocks. The other formats (DOCX, PPTX, XLSX, ODT, HTML, MD, TXT)
+   will read directly into IR with no analyser stage.
 
-The other formats the project will support (DOCX, PPTX, XLSX, ODT, HTML, MD, TXT)
-read directly into IR with no analyser stage.
+`rules.rs` reads the page's horizontal ruling lines, which `analyze.rs` uses to
+group table rows; it is a side input to stage 3, not a fourth stage.
 
 ### Why the analyser looks strange
 
 Grouping text by baseline is a **two-dimensional** problem, and almost every
-non-obvious constant in `layout.rs` / `analyze.rs` is a scar from a real document.
-Highlights (full detail in `docs/phase0-findings.md`, findings A1–A4, D1–D13):
+non-obvious constant in `layout.rs` / `analyze.rs` is a scar from a real
+document. Highlights (full detail in `docs/phase0-findings.md`, findings
+A1–A4, D1–D16):
 
 - Bands are built by sorting glyphs **baseline-descending** and offering each
   glyph to the nearest existing band first (`BAND_SEARCH`), then re-anchoring a
@@ -219,33 +211,35 @@ Highlights (full detail in `docs/phase0-findings.md`, findings A1–A4, D1–D13
   Without it, `2ème` splits.
 - The script test must be **symmetric** (`min < max * SCRIPT_SIZE`) and the raise
   must be bounded **both** against the base text (`SCRIPT_RAISE_EM`) and against
-  the glyph's own height (`SCRIPT_RAISE_OWN`). One bound alone merges a bullet into
-  the title above it, or an 11 pt line into a 24 pt heading.
-- Word gaps use **loose (advance) boxes**, never tight (ink) boxes, and the space
-  width is measured per page from the page's own `U+0020`.
-- A band of nothing but whitespace is dropped, because whitespace has a size and a
-  size above the body's reads as a heading (this produced an empty `H3` from a
+  the glyph's own height (`SCRIPT_RAISE_OWN`). One bound alone merges a bullet
+  into the title above it, or an 11 pt line into a 24 pt heading.
+- Word gaps use **loose (advance) boxes**, never tight (ink) boxes, and the
+  space width is measured per page from the page's own `U+0020`.
+- A band of nothing but whitespace is dropped, because whitespace has a size and
+  a size above the body's reads as a heading (this produced an empty `H3` from a
   single 12 pt space).
 - Line font size is the **character-weighted dominant** size, not the maximum.
 
 ### Deliberate v1 scope decisions — do not relitigate without reason
 
-- **OCR is out of scope.** Text-based PDFs only. Leave the architectural hook; do
-  not build it.
+- **OCR is out of scope.** Text-based PDFs only. Leave the architectural hook;
+  do not build it.
 - **No de-hyphenation.** A trailing hyphen is ambiguous, and joining wrongly
   corrupts two words. Leave it.
 - **Dropped code points are reported, never guessed.** PDFium maps some real
   `U+002D` hyphens to `U+0002`. The character is not recoverable, and a wrong
-  character is invisible corruption where an omission is a visible gap. The reader
-  keeps a histogram and the CLI prints it.
-- **Lists use literal markers + hanging indent**, not `w:numPr`/`numbering.xml`.
-- **Images emit a `[alt]` placeholder paragraph**; footnote refs become superscript
-  `[label]` with no note body.
-- **`w:sz` is emitted explicitly on every run.** `w:pPr/w:rPr` does *not* apply to
-  runs.
-- **Twips/EMU round half-away-from-zero**, not truncate.
-- **Format dispatch is a closed `match`, not a plugin registry**, until there is a
-  second reader or writer to register.
+  character is invisible corruption where an omission is a visible gap. The
+  reader keeps a histogram and the CLI prints it.
+- **Lists use literal markers + a hanging indent** (`w:ind w:hanging="360"`),
+  not `w:numPr`/`numbering.xml`.
+- **Images emit a `[alt]` placeholder paragraph**; footnote refs become
+  superscript `[label]` with no note body.
+- **`w:sz` is emitted explicitly on every run.** `w:pPr/w:rPr` does *not* apply
+  to runs.
+- **Twips/EMU round half-away-from-zero** (`round_half_away` in `dconv-ir`),
+  never truncate.
+- **Format dispatch is a closed `match`, not a plugin registry**, until there is
+  a second reader or writer to register.
 - **Explicit `Block::PageBreak` between pages**, not after the last.
 
 ---
@@ -253,9 +247,9 @@ Highlights (full detail in `docs/phase0-findings.md`, findings A1–A4, D1–D13
 ## The engine facade
 
 `engine/convert/src/lib.rs` is the only conversion entry point, for both front
-ends. Neither the CLI nor the GUI owns any conversion logic — they differ only in
-how they collect inputs and show progress. This is what makes byte-identical CLI
-and GUI output achievable rather than aspirational.
+ends. Neither the CLI nor the GUI owns any conversion logic — they differ only
+in how they collect inputs and show progress. This is what makes byte-identical
+CLI and GUI output achievable rather than aspirational.
 
 ```rust
 let engine = Converter::bind()?;                     // binds PDFium (once per process)
@@ -263,7 +257,8 @@ let report = engine.convert(&input, &output, &mut sink)?;   // reader+writer by 
 let document = engine.analyse(&input, &mut sink)?;          // no write, for inspection
 ```
 
-`Sink` (`engine/pdf/src/lib.rs`) is the progress *and cancellation* interface:
+`Sink` (`engine/pdf/src/lib.rs`, re-exported) is the progress *and cancellation*
+interface:
 
 ```rust
 fn page(&mut self, done: usize, total: usize)   // after each page
@@ -271,9 +266,9 @@ fn cancelled(&self) -> bool                     // checked between pages only
 ```
 
 A trait rather than a closure because cancellation has to travel back from the
-caller, and killing a thread is not an option — PDFium's state is process-global.
-Cancellation is deliberately only consulted **between** pages: interrupting one
-mid-read would leave PDFium's iterator undefined.
+caller, and killing a thread is not an option — PDFium's state is
+process-global. Cancellation is deliberately only consulted **between** pages:
+interrupting one mid-read would leave PDFium's iterator undefined.
 
 ### What the facade can do: ask it, do not mirror it
 
@@ -285,15 +280,15 @@ pub fn readers() -> Vec<Format>                     // every source it reads
 pub fn all_targets() -> Vec<Format>                 // the union a settings panel offers
 ```
 
-`CONVERSIONS` is the list `Converter::convert` gates on, and every query is derived
-from it, so a front end cannot offer a format the facade will refuse. The dispatch
-`match` decides only *how*; the table decides *whether*. A test walks every pair of
-known formats and fails if the two disagree, because a row with no match arm is a
-promise that dies at the last moment — once per file, after the queue has been
-accepted.
+`CONVERSIONS` is the list `Converter::convert` gates on, and every query is
+derived from it, so a front end cannot offer a format the facade will refuse.
+The dispatch `match` decides only *how*; the table decides *whether*. A test
+walks every pair of known formats and fails if the two disagree, because a row
+with no match arm is a promise that dies at the last moment — once per file,
+after the queue has been accepted.
 
-`Format::from_extension` exists for the same reason: a front end filters a queue by
-extension string long before it has a path to hand `Format::from_path`.
+`Format::from_extension` exists for the same reason: a front end filters a queue
+by extension string long before it has a path to hand `Format::from_path`.
 
 Two types are re-exported so a front end need not depend on the reader crate:
 `PdfError` (cancellation reaches a caller as `PdfError::Cancelled` through the
@@ -301,57 +296,40 @@ reader chain) and `ReadStats` (the diagnostics a conversion reports *are* one).
 
 ### Critical: PDFium binds once per *process*
 
-`bind_to_library` routes through a process-global static; the **second bind in a
-process fails** (finding A1). Consequences:
+`bind_to_library` routes through a process-global static; the **second bind in
+a process fails** (finding A1). Consequences:
 
-- One `Converter` per process, reused for a whole batch. Both front ends do this.
-- Real parallelism therefore requires a **pool of worker processes**, not threads.
-  Both front ends have one, built the same way: re-invoke the current executable
-  with a hidden flag (`dconvert --dconvert-worker`, `dconv --dconv-worker`) and
-  speak one JSON object per line over its pipes. Re-running itself is what keeps
-  the deliverable one file, and it means a worker can never be a different build
-  from the parent that spawned it.
-- For single-file delivery the DLL is embedded with `include_bytes!` and unpacked
-  into a version-keyed cache on first run — in `engine/pdf/build.rs` and
-  `bind::unpack_embedded`. A build carries the copy only if the vendored library
-  was present when it was compiled, so the fetch script must run *before* the
-  build that ships. Static linking is not possible (`lib/pdfium.dll.lib` is an
-  *import* library) — see the corrections section of the findings.
+- One `Converter` per process, reused for a whole batch. Both front ends do
+  this.
+- Real parallelism therefore requires a **pool of worker processes**, not
+  threads. Both front ends have one, built the same way: re-invoke the current
+  executable with a hidden flag (`dconvert --dconvert-worker`,
+  `dconv --dconv-worker`) and speak one JSON object per line over its pipes.
+  Re-running itself is what keeps the deliverable one file, and it means a
+  worker can never be a different build from the parent that spawned it.
+- For single-file delivery the DLL is embedded with `include_bytes!` and
+  unpacked into a version-keyed cache on first run — in `engine/pdf/build.rs`
+  and `bind::unpack_embedded`. A build carries the copy only if the vendored
+  library was present when it was compiled, so the fetch script must run
+  *before* the build that ships. Static linking is not possible
+  (`lib/pdfium.dll.lib` is an *import* library).
 
 ---
 
 ## The GUI (`app/`)
 
 The egui/eframe 0.37 shell is complete (20 tests including an end-to-end
-worker-vs-golden run in `app/tests/`) and converts for real: the facade runs
-in a pool of worker **processes**, not threads.
+worker-vs-golden run in `app/tests/`) and converts for real: the facade runs in
+a pool of worker **processes**, not threads.
 
 ```
-app/src/main.rs       eframe setup; the worker-mode gate; picks the engine
-                      (real pool in production; demo swappable one line away)
-app/src/engine.rs     the engine boundary: protocol types + the real
-                      worker-process pool + capability list; `engine::demo`
-                      holds the M0 demo pool for PDFium-free UI review
-app/src/state.rs      jobs, queue, settings, output naming (egui-free, tested)
-app/src/ui.rs         all drawing
-app/src/app.rs        the eframe App: owns state, drains events, paints
-app/src/log_ring.rs   bounded in-memory log backing the console tab
+app/src/main.rs      eframe setup; the --dconvert-worker gate; picks the engine
+app/src/engine.rs    protocol types + the real worker-process pool + capability
+                     delegation; `engine::demo` is the PDFium-free review engine
+app/src/state.rs     jobs, queue, settings, output naming (egui-free, tested)
+app/src/ui.rs        all drawing        app/src/app.rs: the eframe App
+app/src/theme.rs     the palette         app/src/log_ring.rs: the console log
 ```
-
-How it looks: `app/src/theme.rs` paints the dark theme with a user-chosen
-five-colour palette — navy `#142537` surfaces, teal `#04BFBF` accents
-(selection, links, progress, Start), orange `#FE773D` for attention/warnings,
-red `#F24130` for failure and crimson `#A63F48` as the danger surface
-(Cancel-all); every other tone is a blend of those, and light mode keeps
-egui's stock visuals so the toggle still means something.
-
-What it does: drag & drop (folders expanded recursively, bounded), add-files and
-add-folder dialogs, a job queue table with per-job progress and control, cancel-all,
-clear-finished, a details/log/warnings tab strip, a settings side panel (target
-format, output folder, overwrite policy, worker count, theme), persisted settings,
-a progress percentage in the window title, and an in-window log fed by `tracing`.
-Formats are offered only as far as the facade can deliver: unsupported files are
-refused at add time with a log line, not as failed jobs.
 
 Two facts a new agent should not trip over:
 
@@ -360,49 +338,28 @@ Two facts a new agent should not trip over:
   eframe's `App` trait method is `fn ui(&mut self, ui, frame)` — not the older
   `update(&mut self, ctx, frame)`. Copy the existing patterns.
 - **Output naming policy lives in the UI**, not the engine. `resolve_output_path`
-  runs once at batch start so the queue can show final names before anything runs.
-  The engine must write **exactly** where it is told. Two same-named inputs from
-  different folders must get distinct outputs.
+  runs once at batch start so the queue can show final names before anything
+  runs. The engine must write **exactly** where it is told. Two same-named
+  inputs from different folders must get distinct outputs.
 
-### How a conversion actually runs
+How a conversion runs: `main` checks for `--dconvert-worker` before any GUI code
+exists and re-invokes this same binary as a hidden worker child, which binds
+PDFium once and processes JSON lines from stdin; the parent streams the queue
+into the children and owns the kill, removing a killed child's half-written
+output so a cancelled job never leaves a broken document behind. Every child
+job is guaranteed a terminal event, so the UI's in-flight counter cannot strand.
 
-1. `main` checks for `--dconvert-worker` before any GUI code exists: the engine
-   re-invokes this same binary as one worker child (hidden, `CREATE_NO_WINDOW`),
-   which binds PDFium once and processes JSON lines from its stdin, emitting
-   one JSON event line per UI event. Byte-identical CLI vs GUI output holds by
-   construction here: the child calls `Converter::convert` exactly the way
-   `dconv` does.
-2. The parent dispatcher queues jobs, streams them into the children's stdin
-   (the pool never idles), and owns the kill. `CancelAll` kills the processes,
-   and a killed child's half-written output file is removed by the parent, so a
-   cancelled job never leaves a broken document behind.
-3. Per-job accounting is enforced twice: terminal lines deregister their job on
-   the way through, and a child's leftover registry is reconciled at death —
-   `Cancelled` if a cancel was unwinding, `Failed` otherwise. The UI's in-flight
-   counter can therefore never strand, short of a lost engine channel.
-
-Format honesty: the settings list and the accepted file extensions come from
+Format honesty: the settings list and the accepted extensions come from
 `engine::supported(ext)` / `readable(path)`, which delegate to the facade's
-capability query — `Format::from_extension` plus `targets_for` / `all_targets`
-over the same `CONVERSIONS` table `convert` gates on. The one hand-written
-thing left is the facade-format → `TargetFormat` mapping
-(`target_of`), and it is an **exhaustive `match` on purpose**: when the facade
-learns a target the UI does not name, `app` fails to compile there and the UI
-owner classifies it — a new format can neither silently fail nor silently
-stay hidden.
-
-### The demo engine
-
-`engine::demo::spawn_demo_engine()` is a one-line swap in `main.rs` away from
-production: a pool of threads that *sleep* instead of converting, the same shape
-as the real pool so UI code cannot tell the difference. Demo sensitivities, so
-every UI path is reviewable without PDFium: a file name containing `fail` fails,
-one containing `warn` emits warnings, and runtimes derive from the file name so
-batches are reproducible.
+capability query. The one hand-written piece is the facade-format →
+`TargetFormat` mapping (`target_of`), and it is an **exhaustive `match` on
+purpose**: when the facade learns a target the UI does not name, `app` fails to
+compile there and the UI owner classifies it — a new format can neither silently
+fail nor silently stay hidden.
 
 ### The frozen protocol
 
-Both implementations must honour `app/src/engine.rs`:
+Both pool implementations must honour `app/src/engine.rs`:
 
 ```rust
 EngineCommand::Start { jobs: Vec<JobSpec>, workers: usize }
@@ -419,45 +376,41 @@ EngineEvent::Cancelled { id }
 
 Contract, in order of how easy it is to get wrong:
 
-1. **Exactly one terminal event per job** (`Finished` / `Failed` / `Cancelled`). A
-   job cancelled mid-flight is still a job that must be accounted for, or the UI's
-   in-flight counter waits forever.
+1. **Exactly one terminal event per job** (`Finished` / `Failed` /
+   `Cancelled`). A job cancelled mid-flight is still a job that must be
+   accounted for, or the UI's in-flight counter waits forever.
 2. **Progress fractions are `0.0..=1.0`.**
-3. The engine never blocks the UI thread; the UI drains events non-blocking once
-   per frame and asks for repaints only while work is live.
+3. The engine never blocks the UI thread; the UI drains events non-blocking
+   once per frame and asks for repaints only while work is live.
 
----
+Progress granularity is per page. Extend `Sink` only if the UI genuinely needs
+more, keeping the CLI on the same interface or the CLI/GUI outputs can drift.
 
-## What the GUI asks of the engine (contract ledger)
+### The demo engine and the palette
 
-Every cross-boundary ask has landed and is wired up:
+`engine::demo::spawn_demo_engine()` is a one-line swap in `main.rs` away from
+production: threads that *sleep* instead of converting, the same shape as the
+real pool. A file name containing `fail` fails, one containing `warn` emits
+warnings, and runtimes derive from the file name — every UI path is reviewable
+without PDFium.
 
-1. ~~**Re-export `PdfError` and `ReadStats` from `dconv-engine`**~~ — landed.
-   `warning_lines` takes `&ReadStats` (the scalars helper is gone), and
-   `explain_error` matches `PdfError::Cancelled` by variant instead of by
-   display string.
-2. ~~**A capability query** (`supported(ext) -> [targets]`)~~ — landed.
-   `engine::supported` / `supported_targets` delegate to `targets_for` /
-   `all_targets`; the only hand-written piece is the exhaustive
-   facade→`TargetFormat` mapping described in the GUI section.
-3. ~~**The GUI half of byte-identical output is "the worker's output equals
-   the committed golden"**~~ — landed as `app/tests/worker_golden.rs`. The
-   test runs this executable as a real `--dconvert-worker` child, sends one
-   job per committed synthetic fixture over the frozen protocol (one
-   process, so it also proves the bind-once property across seven jobs), and
-   asserts the output bytes equal the goldens. No CLI involved, as
-   specified.
-4. **Progress granularity is per page.** Fine as it is; extend `Sink` only if the
-   UI genuinely needs more, keeping the CLI on the same interface or the outputs
-   can drift.
+`theme.rs` pins a five-colour palette — navy `#142537` surfaces, teal `#04BFBF`
+accents, orange `#FE773D` warnings, red `#F24130` failure, crimson `#A63F48` as
+the danger surface (Cancel-all, and the overwrite confirmation) — and every
+other tone is a blend of those five, plus one derived text-red (`#F57164`,
+RED a quarter toward white) because RED itself measures only 4.1:1 as text on
+the navy. The app is **permanently dark**: the old light mode was egui's stock
+visuals, on which the status colours measured 2.3–3.7:1, and `theme.rs`'s
+contrast tests hold every text colour to 4.5:1 against its surface. Do not
+introduce a colour outside the palette.
 
 ---
 
 ## Measuring fidelity
 
-The numbers this project quotes come from a harness that reads the text back **out
-of the produced `.docx`**, not out of the IR, so a writer bug cannot hide behind
-the reader that fed it. The reference is MuPDF (PyMuPDF), an independent
+The numbers this project quotes come from a harness that reads the text back
+**out of the produced `.docx`**, not out of the IR, so a writer bug cannot hide
+behind the reader that fed it. The reference is MuPDF (PyMuPDF), an independent
 implementation.
 
 ```powershell
@@ -470,60 +423,58 @@ python scripts\compare_docx.py "out\<doc>.docx" "tests\fixtures\private\<doc>.pd
 | Document | Pages | Word error | Similarity | Missing | Extra |
 | --- | --- | --- | --- | --- | --- |
 | `3IRS_TP2.pdf` | 5 | **1.28 %** | 99.21 % | 1 | 1 |
-| `TP2 Admin BD 2026_2027.pdf` | 6 | 6.92 % | 96.34 % | 3 | 3 |
+| `TP2 Admin BD 2026_2027.pdf` | 6 | 3.76 % | 97.92 % | 3 | 3 |
 
 **Read the missing/extra columns, not the headline.** Word error rate is
 order-sensitive and its reference is MuPDF's own block order, which is not
-guaranteed to be reading order. Missing/extra tokens are order-*independent* and
+guaranteed to be reading order. Missing/extra tokens are order-independent and
 are the honest measure of extraction. Both documents' token counts match the
 reference exactly, so **every remaining difference is ordering except four
-tokens** — and all four are the `U+0002` hyphen.
+tokens** — all four are the `U+0002` hyphen.
 
-`scripts/textdiff.py` holds the single implementation of normalisation and token
-reporting; both harnesses import it. Do not fork it.
+`scripts/textdiff.py` holds the single implementation of normalisation and
+token reporting; both harnesses import it. Do not fork it.
 
-The synthetic fixtures are a separate instrument that answers a different
-question. `scripts/make_fixtures.py` generates them, so their geometry is stated
-rather than inferred, and each one targets a rule that has a finding behind it.
-`cargo test -p dconv-engine --profile spike` converts all seven and compares the
-bytes with `tests/fixtures/synthetic/<name>.golden.docx`. Two of them
-(`table-wrapped`, `columns`) pin output that is **known to be wrong**, on purpose:
-the day either is fixed, it shows up as a diff rather than as a surprise.
-`table-wrapped`'s diff got smaller — the wrapped right cell now merges into its
-row — and what it still pins is explained in gap 2. Re-bless
-a deliberate change with `$env:DCONV_BLESS = "1"`, then read
-`git diff tests/fixtures/synthetic` before committing — a blessing nobody read is
-a test that has quietly stopped testing anything.
+Also available: `scripts/compare_text.py` (extractor-level diff, no DOCX
+involved), `scripts/validate_docx.py` (independent structural validation with
+python-docx — `--sample` adds assertions about the hand-written sample only),
+`scripts/cpu-scale.py` (pool scaling). Keep structural checks (always true of
+any `.docx` written here) separate from sample-content assertions (true only of
+a specific fixture).
 
-The fixtures are also the reason the byte-for-byte claim is now checkable. Nothing
-asserts a *number* about them; the assertion is that the bytes do not change, which
-is the only thing that catches a writer that has picked up a clock or an unordered
-iteration.
+### The synthetic fixtures and the bless rule
 
-Also available: `scripts/compare_text.py` (extractor-level diff, no DOCX involved),
-`scripts/validate_docx.py` (independent structural validation with python-docx —
-`--sample` adds assertions about the hand-written sample only), `scripts/cpu-scale.py`
-(pool scaling).
+`cargo test -p dconv-engine --profile spike` converts all seven `synthetic/`
+fixtures and compares the bytes with their committed goldens; `dconv-cli`'s
+pool test and `dconv-app`'s worker test compare their outputs with the same
+goldens. The assertion is byte equality — the only check that catches a writer
+that has picked up a clock or an unordered iteration. One fixture (`columns`)
+pins output that is **known to be wrong**, on purpose: the day it is fixed, it
+shows up as a diff rather than as a surprise. `table-wrapped` was the second
+until Stage 2 read its rulings; its golden moved from four rows to three, and
+the diff was read before blessing.
 
-A validator that fails on a valid document teaches you to ignore it. Keep
-structural checks (always true of any `.docx` we write) separate from
-sample-content assertions (true only of a specific fixture).
+Re-bless a deliberate change with `$env:DCONV_BLESS = "1"`, then read
+`git diff tests/fixtures/synthetic` before committing — a blessing nobody read
+is a test that has quietly stopped testing anything.
 
 ---
 
 ## Debugging "why did this line come out wrong?"
 
-This is *the* question that gets asked, so there are two tools for it. Reach for
-them instead of inferring from a second library, which reintroduces the very
-assumptions under test:
+This is *the* question that gets asked, so there are two tools for it. Reach
+for them instead of inferring from a second library, which reintroduces the
+very assumptions under test:
 
 ```powershell
 # The analysed block tree: headings, paragraphs, lists, tables, page breaks.
 target\spike\dconv.exe --dump "tests\fixtures\private\<doc>.pdf"
 
 # The bands and segments, with the geometry behind them (and every glyph's
-# x/bottom/size in bander-walk order with --glyphs). This is how findings D7-D9
-# were found.
+# x/bottom/size in bander-walk order with --glyphs). This is how findings
+# D7-D9 were found. --rules prints the horizontal rulings, merged per border;
+# a row boundary that reads wrong is usually a rule that was missed or merged
+# into its neighbour.
 cargo run -p dconv-pdf --profile spike --example bands -- "tests\fixtures\private\<doc>.pdf" 2 --glyphs
 ```
 
@@ -532,25 +483,25 @@ cargo run -p dconv-pdf --profile spike --example bands -- "tests\fixtures\privat
 ## Conventions
 
 - **Comments explain why, and cite the evidence.** The existing style names the
-  real document, the measured number, or the failed alternative. A constant with a
-  plausible-sounding justification is worth less than one that says which document
-  contradicted it.
+  real document, the measured number, or the failed alternative. A constant
+  with a plausible-sounding justification is worth less than one that says
+  which document contradicted it.
 - **Every analyser bug becomes a regression test built from the geometry that
   produced it** — real coordinates, not a tidied-up version. See
   `a_smaller_line_below_a_heading_is_not_a_subscript` in `layout.rs`, and
   `the_real_threescript_geometry_survives_the_constants`, which reproduces the
-  measured 11.04/6.96 pt `3ème` because the comfortable 4 pt version of the same
-  test would not notice the constants moving.
+  measured 11.04/6.96 pt `3ème` because the comfortable 4 pt version of the
+  same test would not notice the constants moving.
 - **Golden files are never blessed without reading the diff.** They are the only
-  check that spans reader, analyser and writer at once, and they are worthless if
-  they are re-blessed reflexively.
+  check that spans reader, analyser and writer at once, and they are worthless
+  if re-blessed reflexively.
 - **No speculative abstraction.** Closed matches until there is a second
   implementation.
-- Rust edition 2024, workspace `rust-version` 1.92. All engine crates are
+- Rust edition 2024, workspace `rust-version` 1.92, all crates
   `publish = false`.
 - Line ending: the repo has LF files and **no `.gitattributes`**, so git warns
-  `LF will be replaced by CRLF` on every `git add`. Harmless, but do not "fix" it
-  mid-task; nothing depends on it yet.
+  `LF will be replaced by CRLF` on every `git add`. Harmless, but do not "fix"
+  it mid-task; nothing depends on it yet.
 
 ---
 
@@ -558,18 +509,20 @@ cargo run -p dconv-pdf --profile spike --example bands -- "tests\fixtures\privat
 
 These have each cost real time here:
 
-- **`>` redirection writes UTF-16 with a BOM.** `dconv --dump > f.txt` then reading
-  it as UTF-8 fails with `byte 0xff in position 0`. Use
+- **`>` redirection writes UTF-16 with a BOM.** `dconv --dump > f.txt` then
+  reading it as UTF-8 fails with `byte 0xff in position 0`. Use
   `Out-File -Encoding utf8`, `[IO.File]::WriteAllText`, or capture with Python's
   `subprocess`.
 - **Capturing a native command's stdout decodes it as the OEM codepage**, so
   `dconv --dump | Out-String` mangles every accent *before* your own
   `[IO.File]::WriteAllText(..., utf8)` gets a chance to preserve them. Set
   `[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)` for the capture
-  too. This one is nasty because the mojibake looks like a reader bug, and because
-  an ASCII-only fixture set never notices it.
-- **Cargo writes progress to stderr, so PowerShell reports a nonzero exit code for
-  successful builds.** Do not read that as failure — read the output.
+  too. This one is nasty because the mojibake looks like a reader bug, and
+  because an ASCII-only fixture set never notices it.
+- **Cargo writes progress to stderr, so PowerShell reports a nonzero exit code
+  for successful builds.** Read the output; the same is true of the Python
+  comparison scripts, which is *meaningful* because they `sys.exit(1)` on a
+  failed check.
 - **Run cargo invocations sequentially.** Parallel runs contend on the
   package-cache file lock and one fails confusingly.
 - **Set `$env:PYTHONIOENCODING = "utf-8"`** before Python, or accented console
@@ -577,98 +530,69 @@ These have each cost real time here:
 - **`Start-Process -PassThru` + `WaitForExit` yields `PeakWorkingSet64 == 0`.**
   Poll with `$p.Refresh()` instead.
 - **Here-strings mangle nested quotes.** Multi-line Python passed through
-  `python -c @"..."@` silently corrupts. Write a `.py` file to
-  `C:\Users\ilyes\AppData\Local\Temp\opencode\` and run that.
-- PowerShell reports nonzero exit for the Python **comparison scripts** too,
-  because they `sys.exit(1)` when a check fails. That one *is* meaningful.
+  `python -c @"..."@` silently corrupts. Write a `.py` file and run that.
 
 ---
 
 ## Where the work stands
 
-**Done and committed** — Phase 0 spikes and findings; the docx writer; the whole
-PDF reader (`bind`, `glyph`, `layout`, `analyze`); the Doc IR; the engine facade,
-including the capability query; the `dconv` CLI with a `-j` worker-process pool;
-the fidelity harnesses; the synthetic fixtures with their golden files; and the
-GUI shell with its real engine (worker-process pool around the facade).
-`git log --oneline` is the source of truth for what
-landed when; this file deliberately names no commit hashes, because a hash in a
-document goes stale the moment anyone commits.
+Done: the PDF reader (`bind`, `glyph`, `layout`, `rules`, `analyze`), the Doc IR, the
+docx writer, the engine facade with the capability query, the `dconv` CLI with
+its `-j` worker pool, the fidelity harnesses, the synthetic fixtures with
+goldens, the GUI with its real engine, packaging, and CI.
+`git log --oneline` is the source of truth for what landed when; this file
+deliberately names no commit hashes, because a hash in a document goes stale
+the moment anyone commits.
 
-**Tests:** 100 — `dconv-ir` 17, `dconv-pdf` 33 (26 geometry, plus the seven bind
-tests that pin what is embedded and how it is unpacked), `dconv-docx` 12,
-`dconv-engine` 9 (eight unit plus the end-to-end golden test), `dconv-cli` 9
-(seven unit, plus two end-to-end pool runs that compare a pooled run with a serial
-one and with the goldens), `dconv-app` 20 (nine queue/settings, two log, eight
-engine protocol, plus the end-to-end worker-vs-golden run in `app/tests/`, which
-skips on a tree that lacks pdfium.dll).
-All green. The engine counts are the engine owner's to move; the app count the UI
-owner's.
+**Tests:** 112 — `dconv-ir` 17, `dconv-pdf` 42 (35 geometry, plus the seven
+bind tests), `dconv-docx` 12, `dconv-engine` 9 (eight unit, plus the end-to-end
+golden run), `dconv-cli` 9 (seven unit, plus two end-to-end pool runs: pooled
+vs serial vs goldens), `dconv-app` 23 (ten queue/settings, two log, eight
+engine protocol, two palette-contrast, plus the worker-vs-golden run in
+`app/tests/`, which skips on a tree that lacks a fetched `pdfium.dll`).
 
 **Known gaps, in the order they are worth doing:**
 
-1. **Multi-column reading order** — the ~140 differing tokens on the second
-   document, and the first thing worth doing next. The diagnosis in this file
-   used to be wrong: they are not lost to wrapped table cells. Fixing that shape
-   on page 1's ACID glossary (one 5×2 table whose tail bands merge into their
-   cells, where the old classifier left a 3-row table plus four stray paragraphs)
-   moved **zero** tokens, because the old code happened to emit those bands in
-   reading order anyway. They are lost to reading *across* the columns instead of
-   down each one: page 2's term/definition glossary, page 3's script list beside
-   the account table, and pages 4-6's "Session A / Session B" layouts all
-   interleave. MuPDF reads page 3 as the whole left list and then the table,
-   which is the model to match. The fix is to split a page into vertical strips
-   at an x-interval no segment's ink crosses, when at least two bands straddle it
-   *and* both sides carry a real share of the content width — the second test is
-   what rejects the table's own internal gutters (measured at [501.20, 521.77]).
-   `Region::Columns` (the two-column page) stays as it is; this is a different
-   split from that one. `tests/fixtures/synthetic/columns.pdf` pins the current,
-   wrong behaviour, so the day it changes is a deliberate diff.
-2. **A row whose every cell wraps** — the residual of the wrapped-cell fix, and
-   what `table-wrapped.pdf`'s golden still pins as wrong on purpose. A band whose
-   cells are a *strict subset* of the previous band's merges into that row (that
-   is what recovers the real glossary), but when every cell of a row wraps, the
-   second line fills exactly the same columns as the first and with no ruling
-   lines read there is nothing geometric left to tell it from a second row.
-   Reading the rulings is the fix; until then the fixture's first row is pinned
-   as `Connecté en` / `session` on two rows.
-3. **Heading inference** — a 12 pt note box in an 11 pt document becomes thirteen
-   spurious `H3`s (`Question :`). Costs **zero** tokens; it is visible fidelity
-   only. Size alone cannot fix it. The document offers a second signal: genuine
-   headings sit 18–30 pt below the preceding line against a 14 pt body pitch,
-   while the note's lines sit 14.5–16.5 pt apart. This is finding D13.
-4. **An ETA in the GUI's top bar**, computable from the per-page progress rate
-   the worker pool already reports. The worker pool, per-page live progress,
-   mid-batch cancel, the capability delegation and the GUI-vs-CLI golden
-   comparison are all in the adapter and its tests now.
-5. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR. This is
-   when the closed `match` in the facade becomes a real registry.
-6. **The superscript bound tightens as the script gets smaller.** The bander
-   measures a script's raise between loose box *bottoms*, and a smaller glyph has a
-   shallower box, so the difference in descent is added to the offset it compares
-   against a bound that shrinks with the script. At the measured proportions the
-   offset is 0.82 of the script against a 0.90 bound; keep the raise the same
-   fraction of the base and shrink the script to half the base's size, and the same
-   arithmetic gives 1.10, which splits. The crossover is near 59 %, real
-   superscripts run 50–70 %, and this is a live edge that no document here sits on.
-   Comparing baselines rather than bottoms is the fix; both real documents would
-   have to be re-measured to re-tune the constants against the new quantity. Full
-   detail in `SCRIPT_RAISE_OWN`'s comment in `engine/pdf/src/layout.rs`.
-7. **What packaging still owes.** `scripts/package.ps1` assembles `dist/`: both
-   executables, each checked to contain the vendored library's bytes, and
-   `LICENSES/` beside them — the notices PDFium and its dependencies require,
-   byte-identical to the copies in `third_party/pdfium/`. The decision was files
-   beside the executables rather than texts embedded and printed by a
-   `--licenses` flag: a redistributor has to be able to pass the notices on, and
-   a folder is easier to hand on than a flag. It does mean the deliverable is a
-   folder and not one file, which is worth knowing before anyone promises "one
-   file" to somebody. Still missing: notices for the Rust crates the
-   executables link —
-   `Cargo.lock` holds 698 packages across every platform and target, and even
-   the Windows subset is too many to write out by hand. `cargo-about` is the
-   tool for collecting those properly and nothing here does it yet; the
-   `LICENSES/README.txt` this script writes says so, where a redistributor reads
-   it rather than where a maintainer does.
-
-Full detail, including the measurements behind each, is in
-`docs/phase0-findings.md`.
+1. **Multi-column reading order** — a remaining block of the 76 differing
+   tokens on the second document. Text is read *across* the columns instead of
+   down each one: page 3's script list beside the account table (the corrected
+   diagnosis is in `docs/phase0-findings.md`). The fix is to split a
+   page into vertical strips at an x-interval no segment's ink crosses, when at
+   least two bands straddle it *and* both sides carry a real share of the content
+   width — the second test is what rejects the table's own internal gutters
+   (measured at [501.20, 521.77]). MuPDF reads page 3 as the whole left list and
+   then the table, which is the model to match. `Region::Columns` (the
+   two-column page) is a different split and stays as it is. `columns.pdf`'s
+   golden pins the current, wrong behaviour on purpose. The rest of the 76 is
+   the page header/footer segment order and the dropped `U+0002` hyphens.
+2. **A fully ruled table with exactly two rows** — the rule-based grouping
+   needs two internal rules before absence of a rule between bands means "same
+   row", because a table that rules only its header would otherwise merge its
+   whole body into one. A two-row table has exactly one internal rule, so it
+   stays on the subset test and an every-cell-wrapped row still splits. Telling
+   the two cases apart needs a second signal (the header's shading is the
+   obvious one); both real documents' wrapped tables have three or more rows,
+   and `table-wrapped.pdf` has three. A producer that draws the whole grid as
+   one path object is the other limit: there is no thin edge to read.
+3. **Heading inference** — a 12 pt note box in an 11 pt document becomes
+   thirteen spurious `H3`s. Costs **zero** tokens; visible fidelity only, and
+   size alone cannot fix it. The second signal is spacing: genuine headings
+   sit 18–30 pt below the preceding line against a 14 pt body pitch, while the
+   note's lines sit 14.5–16.5 pt apart. This is finding D13.
+4. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR.
+   This is when the closed `match` in the facade becomes a real registry.
+5. **The superscript bound tightens as the script gets smaller.** The bander
+   measures a script's raise between loose box *bottoms*, and a smaller glyph
+   has a shallower box, so the offset it compares against a bound that shrinks
+   with the script arrives inflated: the crossover is near 59 %, real
+   superscripts run 50–70 %, and this is a live edge no document here sits on.
+   The fix is comparing baselines rather than bottoms, which needs both real
+   documents re-measured. Full detail in `SCRIPT_RAISE_OWN`'s comment in
+   `engine/pdf/src/layout.rs`.
+6. **Rust crate notices.** `scripts/package.ps1` ships `LICENSES/` beside the
+   executables (the deliverable is a folder, not one file — decided, so nobody
+   promises "one file"), every file verbatim from `third_party/pdfium/` and
+   hash-checked by CI. Still missing: the notices for the crates the
+   executables link. `Cargo.lock` resolves 698 packages; `cargo-about` is the
+   intended tool, and `LICENSES/README.txt` says so where a redistributor
+   reads it.
