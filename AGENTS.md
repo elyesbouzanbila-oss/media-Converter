@@ -219,6 +219,12 @@ A1–A4, D1–D16):
   a size above the body's reads as a heading (this produced an empty `H3` from a
   single 12 pt space).
 - Line font size is the **character-weighted dominant** size, not the maximum.
+- A heading needs **both** a size margin and space above it. The 12 pt note in
+  `TP2 Admin BD`'s 11 pt body is only 1.0 pt above the body, while the smallest
+  genuine heading is 12.5 pt; `HEADING_MIN_ABOVE_BODY` excludes it. Spacing
+  (`HEADING_GAP_PT`) is the second signal, but it cannot do the job alone: six
+  of the note's lines follow a code block and sit 23–34 pt below it. This is
+  finding D13's resolution.
 
 ### Deliberate v1 scope decisions — do not relitigate without reason
 
@@ -544,7 +550,7 @@ goldens, the GUI with its real engine, packaging, and CI.
 deliberately names no commit hashes, because a hash in a document goes stale
 the moment anyone commits.
 
-**Tests:** 112 — `dconv-ir` 17, `dconv-pdf` 42 (35 geometry, plus the seven
+**Tests:** 115 — `dconv-ir` 17, `dconv-pdf` 45 (38 geometry, plus the seven
 bind tests), `dconv-docx` 12, `dconv-engine` 9 (eight unit, plus the end-to-end
 golden run), `dconv-cli` 9 (seven unit, plus two end-to-end pool runs: pooled
 vs serial vs goldens), `dconv-app` 23 (ten queue/settings, two log, eight
@@ -574,14 +580,9 @@ engine protocol, two palette-contrast, plus the worker-vs-golden run in
    obvious one); both real documents' wrapped tables have three or more rows,
    and `table-wrapped.pdf` has three. A producer that draws the whole grid as
    one path object is the other limit: there is no thin edge to read.
-3. **Heading inference** — a 12 pt note box in an 11 pt document becomes
-   thirteen spurious `H3`s. Costs **zero** tokens; visible fidelity only, and
-   size alone cannot fix it. The second signal is spacing: genuine headings
-   sit 18–30 pt below the preceding line against a 14 pt body pitch, while the
-   note's lines sit 14.5–16.5 pt apart. This is finding D13.
-4. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR.
+3. **More readers/writers** — DOCX, PPTX, XLSX, ODT, HTML, MD, TXT into IR.
    This is when the closed `match` in the facade becomes a real registry.
-5. **The superscript bound tightens as the script gets smaller.** The bander
+4. **The superscript bound tightens as the script gets smaller.** The bander
    measures a script's raise between loose box *bottoms*, and a smaller glyph
    has a shallower box, so the offset it compares against a bound that shrinks
    with the script arrives inflated: the crossover is near 59 %, real
@@ -589,7 +590,7 @@ engine protocol, two palette-contrast, plus the worker-vs-golden run in
    The fix is comparing baselines rather than bottoms, which needs both real
    documents re-measured. Full detail in `SCRIPT_RAISE_OWN`'s comment in
    `engine/pdf/src/layout.rs`.
-6. **Rust crate notices.** `scripts/package.ps1` ships `LICENSES/` beside the
+5. **Rust crate notices.** `scripts/package.ps1` ships `LICENSES/` beside the
    executables (the deliverable is a folder, not one file — decided, so nobody
    promises "one file"), every file verbatim from `third_party/pdfium/` and
    hash-checked by CI. Still missing: the notices for the crates the

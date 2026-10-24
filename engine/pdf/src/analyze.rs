@@ -31,6 +31,28 @@ use crate::rules::Rule;
 /// stray oversized glyph headlining an entire paragraph.
 const HEADING_MAX_CHARS: usize = 90;
 
+/// How far above the body size a line must be set before it can be a heading.
+///
+/// The old 0.5 margin promoted `TP2 Admin BD 2026_2027.pdf`'s 12pt note and
+/// exercise box in an 11pt body to H3 thirteen times. The smallest genuine
+/// heading in the corpus is 12.5pt in that same 11pt body (1.5pt above); the
+/// note is 12.0 (1.0pt above). A strict 1.0pt margin excludes the note and
+/// keeps every measured heading. Spacing is the second signal, not a
+/// substitute: six of the thirteen 12pt lines follow a code block or a table
+/// and sit 23-34pt below it, and a seventh opens a page with no gap to
+/// measure, so a spacing-only rule would keep all seven.
+const HEADING_MIN_ABOVE_BODY: f32 = 1.0;
+
+/// How much space a heading-sized line needs above it to be a heading.
+///
+/// Measured on page 3 of `TP2 Admin BD 2026_2027.pdf`: genuine headings sit
+/// 19.77-19.97pt above the preceding baseline, while the 12pt lines directly
+/// under body text sit 14.80-16.68pt apart. The smallest genuine gap in the
+/// corpus is 19.56pt (3IRS's wrapped `machine virtuelle` heading), so 17.5pt
+/// separates them with margin. A line that opens a page or a column has no
+/// predecessor and keeps the size rule.
+const HEADING_GAP_PT: f32 = 17.5;
+
 /// How far a segment's left edge may drift and still count as the same table
 /// column, as a fraction of the run's largest glyph.
 const COLUMN_TOLERANCE_EM: f32 = 0.9;
@@ -169,7 +191,7 @@ impl DocumentProfile {
         let mut heading_sizes: Vec<f32> = histogram
             .iter()
             .map(|(key, _)| *key as f32 / 2.0)
-            .filter(|size| *size > body_size + 0.5)
+            .filter(|size| *size > body_size + HEADING_MIN_ABOVE_BODY)
             .collect();
         heading_sizes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
         heading_sizes.truncate(6);
@@ -182,11 +204,12 @@ impl DocumentProfile {
 
     /// Heading level for a size, if it is heading-sized at all.
     ///
-    /// Size is the only signal used. On one real document the H1 and H2 are both
-    /// 13pt and differ only by italic, so this will merge them — a known gap,
-    /// recorded rather than papered over with a guess.
+    /// Size is the first signal; `heading_level` adds the vertical gap. On one
+    /// real document the H1 and H2 are both 13pt and differ only by italic, so
+    /// this will merge them — a known gap, recorded rather than papered over
+    /// with a guess.
     pub fn level_for(&self, size: f32) -> Option<u8> {
-        if size <= self.body_size + 0.5 {
+        if size <= self.body_size + HEADING_MIN_ABOVE_BODY {
             return None;
         }
         let index = self
@@ -199,15 +222,16 @@ impl DocumentProfile {
 
 /// One visual line, ready to be classified.
 ///
-/// A line's vertical extent is not kept: it is only needed to measure a whole
-/// aligned region, and that is measured from the bands, which carry the extent
-/// for every segment rather than only for the first and last.
+/// The band's bottom is kept as the baseline proxy for the heading spacing
+/// test; the full extent is only needed to measure a whole aligned region, and
+/// that is measured from the bands.
 #[derive(Debug, Clone)]
 struct Line {
     inlines: Vec<Inline>,
     text: String,
     left: f32,
     right: f32,
+    bottom: f32,
     size: f32,
     bold: bool,
     italic: bool,
@@ -228,6 +252,7 @@ impl Line {
             text: band.text(),
             left: band.segments.first().map(|s| s.left).unwrap_or(0.0),
             right: band.segments.last().map(|s| s.right).unwrap_or(0.0),
+            bottom: band.bottom,
             size: weighted_size(&band.segments),
             bold: weighted_majority(&band.segments, |s| s.bold),
             italic: weighted_majority(&band.segments, |s| s.italic),
@@ -1151,8 +1176,9 @@ fn emit_flow(bands: &[Band], profile: &DocumentProfile, blocks: &mut Vec<Block>)
     let mut index = 0;
     while index < lines.len() {
         let line = &lines[index];
+        let previous_bottom = index.checked_sub(1).map(|i| lines[i].bottom);
 
-        if let Some(level) = heading_level(line, profile) {
+        if let Some(level) = heading_level(line, profile, previous_bottom) {
             blocks.push(Block::Heading {
                 level,
                 content: line.inlines.clone(),
@@ -1179,11 +1205,27 @@ fn emit_flow(bands: &[Band], profile: &DocumentProfile, blocks: &mut Vec<Block>)
     }
 }
 
-fn heading_level(line: &Line, profile: &DocumentProfile) -> Option<u8> {
+/// Classify one line as a heading from its size and the space above it.
+///
+/// The gap is measured between band bottoms, the baseline proxy the layout
+/// pass preserves. A line that opens a page or a column has no predecessor in
+/// its band slice and keeps the size rule; that is the only case where a
+/// tightly spaced note at a heading size can still pass.
+fn heading_level(
+    line: &Line,
+    profile: &DocumentProfile,
+    previous_bottom: Option<f32>,
+) -> Option<u8> {
     if line.text.chars().count() > HEADING_MAX_CHARS {
         return None;
     }
-    profile.level_for(line.size)
+    let level = profile.level_for(line.size)?;
+    if let Some(previous) = previous_bottom {
+        if previous - line.bottom < HEADING_GAP_PT {
+            return None;
+        }
+    }
+    Some(level)
 }
 
 /// Join lines into one paragraph while the source's line breaks are soft.
@@ -1786,7 +1828,9 @@ mod tests {
     #[test]
     fn heading_sizes_are_ranked_and_become_levels() {
         let mut glyphs = line("Titre principal", 16.0, 100.0, 0.0, false);
-        glyphs.extend(line("Définition", 14.0, 86.0, 0.0, false));
+        // 20pt above the title: the spacing gate now applies to every heading,
+        // so a 14pt line 14pt below the title would be demoted.
+        glyphs.extend(line("Définition", 14.0, 80.0, 0.0, false));
         glyphs.extend(line(
             "Le corps du texte est ici et il est long, bien plus long que les titres, \
              ce qui doit suffire a en faire la taille dominante du document entier.",
@@ -1804,6 +1848,122 @@ mod tests {
         assert!(matches!(blocks[0], Block::Heading { level: 1, .. }));
         assert!(matches!(blocks[1], Block::Heading { level: 2, .. }));
         assert!(matches!(blocks[2], Block::Paragraph { .. }));
+    }
+
+    #[test]
+    fn a_twelve_point_note_after_a_code_block_is_not_a_heading() {
+        // Page 4 of `TP2 Admin BD 2026_2027.pdf`, measured: the 12pt
+        // "Question :" at 411.32 follows the 5.2 block at 444.11, a 32.79pt
+        // gap. Spacing alone would keep it; the 12.0 size is only 1.0pt above
+        // the 11pt body, while the document's smallest genuine heading is
+        // 12.5pt. This is the case the size margin exists for.
+        let bands = vec![
+            band(
+                444.11,
+                457.54,
+                vec![segment(
+                    "UPDATE Compte SET solde = solde - 100 WHERE numcpte = 1;",
+                    42.62,
+                    444.11,
+                    11.0,
+                    false,
+                )],
+            ),
+            band(
+                411.32,
+                425.97,
+                vec![segment("Question :", 42.62, 411.32, 12.0, true)],
+            ),
+            band(
+                396.80,
+                410.23,
+                vec![segment(
+                    "Comparez les résultats de [A1] et [A2].",
+                    60.42,
+                    396.80,
+                    11.0,
+                    false,
+                )],
+            ),
+        ];
+        let profile = DocumentProfile {
+            body_size: 11.0,
+            heading_sizes: vec![13.0, 12.5, 12.0],
+        };
+
+        let blocks = build_page(&bands, &[], &profile, &page());
+        let headings = blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Heading { .. }))
+            .count();
+        assert_eq!(headings, 0, "{blocks:#?}");
+    }
+
+    #[test]
+    fn a_heading_sized_line_without_space_above_is_not_a_heading() {
+        // The real 16.67pt gap from page 3, with the line set at 12.5pt so the
+        // size margin admits it and only the spacing gate can refuse it.
+        let bands = vec![
+            band(
+                332.17,
+                345.60,
+                vec![segment("h) Validez la transaction.", 42.62, 332.17, 11.0, false)],
+            ),
+            band(
+                315.50,
+                330.15,
+                vec![segment("Question :", 42.62, 315.50, 12.5, true)],
+            ),
+            band(
+                300.98,
+                314.41,
+                vec![segment(
+                    "Expliquez précisément ce que ROLLBACK TO sp2 annule.",
+                    60.42,
+                    300.98,
+                    11.0,
+                    false,
+                )],
+            ),
+        ];
+        let profile = DocumentProfile {
+            body_size: 11.0,
+            heading_sizes: vec![13.0, 12.5],
+        };
+
+        let blocks = build_page(&bands, &[], &profile, &page());
+        let headings = blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Heading { .. }))
+            .count();
+        assert_eq!(headings, 0, "{blocks:#?}");
+    }
+
+    #[test]
+    fn the_first_line_on_a_page_keeps_the_size_rule() {
+        // Page 4 opens on "5.1. Lecture sale..." with no band above it in the
+        // page's slice. There is no gap to measure, so size decides.
+        let bands = vec![band(
+            741.91,
+            757.79,
+            vec![segment(
+                "5.1. Lecture sale (Dirty Read) test de non-reproductibilité sous Oracle",
+                78.62,
+                741.91,
+                13.0,
+                true,
+            )],
+        )];
+        let profile = DocumentProfile {
+            body_size: 11.0,
+            heading_sizes: vec![16.0, 13.0, 12.5],
+        };
+
+        let blocks = build_page(&bands, &[], &profile, &page());
+        assert!(
+            matches!(blocks[0], Block::Heading { level: 2, .. }),
+            "{blocks:#?}"
+        );
     }
 
     #[test]

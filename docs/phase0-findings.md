@@ -456,6 +456,34 @@ is worth fixing next rather than now — a heading rule is the kind of thing wor
 agreeing on before it is written, and finding D2's note that H1 and H2 may differ
 only by italic is the same open question.
 
+### Resolution (Stage 3)
+
+The Stage 3 audit corrected the last paragraph's hypothesis. Spacing alone does
+not separate this note box: six of the thirteen 12 pt lines follow a code block
+or a table and sit **23–34 pt** below it, more than a genuine heading's
+19.77–19.97 pt, and a seventh opens a page with no gap to measure. A
+spacing-only rule would keep all seven. The decisive signal is the size margin.
+The note is 12.0 pt in an 11 pt body, only 1.0 pt above it, while every genuine
+heading in the corpus is at least 12.5 pt in that document and 14 pt in 3IRS's
+12 pt body. `HEADING_MIN_ABOVE_BODY` is now **1.0 pt**, so
+12.0 is not heading-sized; `HEADING_GAP_PT` (**17.5 pt**) remains the second
+signal for a line that clears it. The smallest genuine gap measured is 19.56 pt,
+3IRS's wrapped `machine virtuelle` heading, so the gate has 2 pt of margin. A
+line that opens a page or a column has no predecessor and keeps the size rule;
+that is what preserves page 4's first `5.1.` heading.
+
+Measured result: `TP2 Admin BD` goes from 38 headings to 25 and all thirteen
+spurious H3s become paragraphs; `3IRS_TP2` stays at 9 headings, and the seven
+synthetic fixtures' block trees are byte-identical. The private documents' token
+counts, missing/extra tokens and word error rates do not move (TP2 3.76 %,
+missing/extra 3/3; 3IRS 1.28 %, 1/1). This is visible fidelity only, exactly as
+D13 predicted. Three regression tests pin the geometry:
+`a_twelve_point_note_after_a_code_block_is_not_a_heading` uses page 4's 32.79 pt
+gap to prove the size margin,
+`a_heading_sized_line_without_space_above_is_not_a_heading` uses page 3's
+16.67 pt gap to prove the spacing gate, and
+`the_first_line_on_a_page_keeps_the_size_rule` covers the no-predecessor case.
+
 ## Correcting the earlier reading-order question
 
 The note that table reconstruction "needs the x-segmentation stage before it can

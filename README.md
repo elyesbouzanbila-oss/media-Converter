@@ -4,7 +4,7 @@
   <a href="#licences"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <img alt="Rust 1.92+" src="https://img.shields.io/badge/rust-1.92%2B-orange.svg?logo=rust&logoColor=white">
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-windows-lightgrey.svg?logo=windows&logoColor=white">
-  <img alt="Version: 0.1.0" src="https://img.shields.io/badge/version-0.1.0-orange.svg">
+  <img alt="Version: 0.1.0-alpha.3" src="https://img.shields.io/badge/version-0.1.0--alpha.3-orange.svg">
   <img alt="Status: in development" src="https://img.shields.io/badge/status-in%20development-orange.svg">
 </p>
 
@@ -22,11 +22,11 @@ byte-identical output.
 > [!NOTE]
 > **Ongoing development**
 > The PDF reader, DOCX writer, engine facade, CLI, GUI and packaging step all
-> work, and the workspace's 100 tests pass. Input formats beyond PDF and targets
+> work, and the workspace's 115 tests pass. Input formats beyond PDF and targets
 > beyond DOCX are planned.
 
 > [!NOTE]
-> **Status: in development (`0.1.0`)**
+> **Status: in development (`0.1.0-alpha.3`)**
 > This is early software. Command-line flags, the GUI's settings format and the
 > shape of the Doc IR may change between versions, without a compatibility
 > guarantee.
