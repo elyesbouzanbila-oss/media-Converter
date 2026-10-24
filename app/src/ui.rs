@@ -7,7 +7,7 @@
 //! [`egui::Panel`] with `left/right/top/bottom` constructors, and every panel
 //! `show` takes the parent `Ui` (which eframe hands the app directly).
 
-use crate::app::{App, BottomTab};
+use crate::app::{App, BottomTab, QueueSort};
 use crate::state::{Job, JobStatus, OutputMode, OverwritePolicy};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -19,15 +19,29 @@ fn status_color(status: &JobStatus, ui: &egui::Ui) -> egui::Color32 {
         JobStatus::Queued => ui.visuals().weak_text_color(),
         JobStatus::Running => crate::theme::TEAL,
         JobStatus::Done => crate::theme::ORANGE,
-        JobStatus::Failed => crate::theme::RED,
-        // A cancelled job reads as "dead": red drained back toward the navy,
-        // so it cannot be mistaken for a live failure (pure `RED` on the
-        // navy) and differs from the queued grey.
-        JobStatus::Cancelled => crate::theme::blend(crate::theme::RED, crate::theme::NAVY, 0.45),
+        JobStatus::Failed => crate::theme::RED_TEXT,
+        // Cancelled joins queued in the weak grey: a dead state, told apart
+        // by its word and its colour-free company rather than by hue. Every
+        // drained-red mixture was measured before this decision (blend(RED,
+        // NAVY, 45 %) ≈ 2.0:1, 20 % ≈ 3.0:1 on the navy) — none passed
+        // 4.5:1, and a tint that dim reads as *a failure that lost its
+        // colour*, which is precisely the confusion it was chosen to avoid.
+        // Both states sit in the "not live" grey family; the label carries
+        // the difference.
+        JobStatus::Cancelled => ui.visuals().weak_text_color(),
     }
 }
 
 const COLOR_WARN: egui::Color32 = crate::theme::ORANGE;
+
+/// "1 document" / "3 documents" — nothing user-facing prints a bare "(s)".
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
 
 fn fmt_elapsed(d: Duration) -> String {
     let s = d.as_secs_f32();
@@ -36,6 +50,38 @@ fn fmt_elapsed(d: Duration) -> String {
     } else {
         format!("{:.0}m {:.0}s", s / 60.0, s % 60.0)
     }
+}
+
+/// Batch-remaining display. Ceilings rather than roundings so the count
+/// never reads "~0s" while pages are still turning; distances past an hour
+/// are presented hourly because a seconds-precision hour-long claim from a
+/// 12 s window would be a guess with decimals on it.
+fn fmt_eta(d: Duration) -> String {
+    let s = d.as_secs_f32();
+    if s < 60.0 {
+        format!("~{}s left", s.ceil() as u32)
+    } else if s < 3600.0 {
+        format!("~{}m left", (s / 60.0).round() as u32)
+    } else {
+        format!("~{}h left", (s / 3600.0).round() as u32)
+    }
+}
+
+/// Tail-and-head-keeping clip: both the stem and the extension stay visible,
+/// which is what distinguishes two same-directory files at a glance
+/// (lists-and-tables.md › Content). Ready to be tightened further by
+/// `Label::truncate()` at the cell edge, which clips in the middle but only
+/// in the rare case this budget still overflows.
+fn middle_ellipsis(s: &str, budget: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let head = (budget - 1) / 2;
+    let tail = budget - 1 - head;
+    if chars.len() <= budget || head == 0 || tail == 0 {
+        return s.to_owned();
+    }
+    let head: String = chars[..head.min(chars.len())].iter().collect();
+    let tail: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 fn path_display(p: &std::path::Path, max_chars: usize) -> String {
@@ -77,11 +123,18 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Panel::top("top_bar").show(ui, |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.heading("dconvert");
-            ui.weak("document converter");
+            // Leading edge: state, not branding. The native title bar
+            // already names the app, and the same words printed twice at the
+            // window's own prime spots is the one piece of chrome this
+            // utility does not need.
+            let counts = app.counts();
             if !app.engine_alive() {
                 ui.colored_label(ui.visuals().error_fg_color, "engine unavailable");
-            } else if app.busy() {
+                if ui.button("Restart engine").clicked() {
+                    app.restart_engine();
+                }
+                ui.weak("files failed during the outage can be retried afterwards");
+            } else if app.converting() {
                 if let Some(p) = app.queue.batch_progress() {
                     ui.add(
                         egui::ProgressBar::new(p)
@@ -89,51 +142,86 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
                             .show_percentage(),
                     );
                 }
+                // Determinate when the pool's page rate supports it; the
+                // estimate disappears rather than guessing while the rate
+                // is unreadable early in a batch.
+                if let Some(eta) = app.eta {
+                    ui.weak(fmt_eta(eta));
+                }
+            } else if counts.queued > 0 {
+                let n = counts.queued;
+                if n == 1 {
+                    ui.weak("1 document queued");
+                } else {
+                    ui.weak(format!("{n} documents queued"));
+                }
+            } else if counts.total > 0 {
+                ui.weak("batch finished");
+            } else {
+                ui.weak("drop documents to queue them");
+            }
+
+            // The setting people look at before Start, readable with the
+            // settings panel closed.
+            ui.weak(format!("→ {}", app.settings.target.label()));
+
+            // The one recovery action a failed batch can need after the
+            // restart: only the disconnect-failed jobs get re-queued here —
+            // real conversion failures would fail identically again.
+            if app.engine_alive() && !app.converting() {
+                let retryable = app
+                    .queue
+                    .jobs()
+                    .iter()
+                    .filter(|j| {
+                        j.status == JobStatus::Failed
+                            && j.detail
+                                .as_deref()
+                                .map_or(false, |d| d.starts_with("engine unavailable"))
+                    })
+                    .count();
+                if retryable > 0
+                    && ui
+                        .button(format!("Retry {}", plural(retryable, "failed document")))
+                        .on_hover_text("Re-queue the documents that failed when the engine went away")
+                        .clicked()
+                {
+                    app.retry_engine_failed();
+                }
+            }
+
+            // Settings on the leading side: infrequent, and the trailing
+            // cluster belongs to the batch actions (toolbars.md › Item
+            // groupings — the primary action on the trailing side).
+            let gear_label = if app.settings_visible {
+                "Settings ⌄"
+            } else {
+                "Settings ›"
+            };
+            if ui
+                .button(gear_label)
+                .on_hover_text(
+                    "Target format, output folder, overwrite policy and workers (Escape closes)",
+                )
+                .clicked()
+            {
+                app.settings_visible = !app.settings_visible;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let gear_label = if app.settings_visible {
-                    "Settings ⌄"
-                } else {
-                    "Settings ›"
-                };
-                if ui.add(egui::Button::new(gear_label)).clicked() {
-                    app.settings_visible = !app.settings_visible;
-                }
-
+                // Fresh for this frame: the leading branch may already have
+                // run a batch (Enter/Start), and enabled-states must react
+                // in the same frame they change.
                 let counts = app.counts();
-                let finished = counts.done + counts.failed + counts.cancelled;
-                if ui
-                    .add_enabled(finished > 0, egui::Button::new("Clear finished"))
-                    .clicked()
-                {
-                    let cleared = app.queue.clear_finished();
-                    app.log
-                        .lock()
-                        .push_timed(format!("cleared {cleared} finished job(s)"));
-                }
-
-                let cancellable =
-                    (counts.queued > 0 || counts.running > 0 || app.engine_in_flight() > 0)
-                        && app.engine_alive();
-                if ui
-                    .add_enabled(
-                        cancellable,
-                        // Danger surface, not danger text: the crimson needs
-                        // a surface to pass contrast on (theme.rs).
-                        egui::Button::new("Cancel all").fill(crate::theme::CRIMSON),
-                    )
-                    .clicked()
-                {
-                    app.cancel_all();
-                }
-
+                // Added first ⇒ rightmost: Start is the window's one
+                // prominent action and sits trailing-most, Cancel all next,
+                // Clear finished last of the batch three.
                 let start_label = if counts.queued > 0 {
                     format!("Start ({} queued)", counts.queued)
                 } else {
                     "Start".to_owned()
                 };
-                if ui
+                let start = ui
                     .add_enabled(
                         counts.queued > 0 && app.engine_alive(),
                         // The one call to action: the accent itself for a
@@ -146,17 +234,62 @@ pub fn draw_top_bar(app: &mut App, ui: &mut egui::Ui) {
                         )
                         .fill(crate::theme::TEAL),
                     )
-                    .clicked()
-                {
+                    .on_hover_text("Convert every queued document (Enter)")
+                    // A greyed button with no reason is a dead end; disabled
+                    // hover text is where egui puts the explanation.
+                    .on_disabled_hover_text(if !app.engine_alive() {
+                        "The engine is unavailable — restart it first"
+                    } else {
+                        "Add documents to start"
+                    });
+                if start.clicked() {
                     app.start_batch();
                 }
 
-                ui.separator();
-                if ui.button("Add folder…").clicked() {
-                    app.add_folder_from_dialog();
+                let cancellable =
+                    (counts.queued > 0 || counts.running > 0 || app.engine_in_flight() > 0)
+                        && app.engine_alive();
+                let cancel = ui
+                    .add_enabled(
+                        cancellable,
+                        // Danger surface, not danger text: the crimson needs
+                        // a surface to pass contrast on (theme.rs).
+                        egui::Button::new("Cancel all").fill(crate::theme::CRIMSON),
+                    )
+                    .on_hover_text(
+                        "Stop after the page in progress — files already written are kept",
+                    )
+                    .on_disabled_hover_text("Nothing is converting");
+                if cancel.clicked() {
+                    app.cancel_all();
                 }
-                if ui.button("Add files…").clicked() {
+
+                let finished = counts.done + counts.failed + counts.cancelled;
+                let clear = ui
+                    .add_enabled(finished > 0, egui::Button::new("Clear finished"))
+                    .on_hover_text("Remove done, failed and cancelled rows from the queue")
+                    .on_disabled_hover_text("No finished documents to clear");
+                if clear.clicked() {
+                    let cleared = app.queue.clear_finished();
+                    app.log
+                        .lock()
+                        .push_timed(format!("cleared {cleared} finished job(s)"));
+                }
+
+                ui.separator();
+                if ui
+                    .button("Add files…")
+                    .on_hover_text("Choose documents to convert (Ctrl+O)")
+                    .clicked()
+                {
                     app.add_files_from_dialog();
+                }
+                if ui
+                    .button("Add folder…")
+                    .on_hover_text("Add every readable document in a folder and its subfolders")
+                    .clicked()
+                {
+                    app.add_folder_from_dialog();
                 }
             });
         });
@@ -243,8 +376,9 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                 if ui
                     .button("Use suggested")
                     .on_hover_text(
-                        "Phase 0 (finding C1): throughput saturates around 8 workers on \
-                         this machine; more only adds churn.",
+                        "Documents convert in parallel; throughput peaks at the \
+                         suggested number on most machines, and adding more \
+                         workers past it only adds process churn.",
                     )
                     .clicked()
                 {
@@ -255,22 +389,6 @@ pub fn draw_settings_panel(app: &mut App, ui: &mut egui::Ui) {
                     crate::state::default_worker_count()
                 ));
             });
-            ui.add_space(8.0);
-
-            ui.strong("Theme");
-            if ui
-                .toggle_value(&mut app.settings.dark_theme, "Dark mode")
-                .clicked()
-            {
-                app.apply_theme(ui.ctx());
-            }
-            ui.add_space(8.0);
-            ui.weak(
-                "Files convert in a pool of worker processes around the real \
-                 facade. During UI review the demo engine swaps in one line — \
-                 a file whose name contains “fail” fails on purpose, “warn” \
-                 produces warnings, and nothing is written to disk.",
-            );
         });
 }
 
@@ -290,31 +408,74 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
         .resizable(true)
         .show(ui, |ui| {
             ui.add_space(6.0);
-            let counts = app.counts();
-            ui.horizontal(|ui| {
-                ui.strong("Queue");
-                ui.weak(format!(
-                    "{} jobs · {} running · {} queued · {} done · {} failed · {} cancelled",
-                    counts.total,
-                    counts.running,
-                    counts.queued,
-                    counts.done,
-                    counts.failed,
-                    counts.cancelled
-                ));
-            });
+            // Just the name: the exact counts live once, in the status bar,
+            // and the empty state lives once, in the central drop zone —
+            // both used to be printed here as well, and a batch converter's
+            // periphery does not need three copies of its own numbers.
+            ui.strong("Queue");
             ui.add_space(2.0);
 
-            let jobs: Vec<Job> = app.queue.jobs().to_vec();
-            if jobs.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("The queue is empty. Use “Add files…”, or drop files anywhere.");
-                });
+            if app.queue.jobs().is_empty() {
                 return;
             }
 
             let selected = app.selected;
+            let sort = app.queue_sort;
+            // Sorted view, never a reorder: the queue's own promise is
+            // arrival order (Queue::add), and the table's job is to show it
+            // the way the user asked to see it. The snapshot is cloned, like
+            // the pre-sorting table always did — the header buttons mutate
+            // `queue_sort` and the rows may mutate the queue, so a borrowed
+            // view would fight the closure captures it crosses.
+            let mut jobs: Vec<Job> = app.queue.jobs().iter().cloned().collect();
+            match sort {
+                QueueSort::Arrival => {}
+                QueueSort::StateAsc | QueueSort::StateDesc => {
+                    // Ascending reads as attention: failed, running, queued,
+                    // cancelled, done. The stable sort keyed directly by
+                    // status keeps ties in arrival order in *both*
+                    // directions (a plain `reverse()` on the vec would
+                    // scramble them in the descending view).
+                    let severity = |job: &Job| match job.status {
+                        JobStatus::Failed => 0u8,
+                        JobStatus::Running => 1,
+                        JobStatus::Queued => 2,
+                        JobStatus::Cancelled => 3,
+                        JobStatus::Done => 4,
+                    };
+                    match sort {
+                        QueueSort::StateDesc => {
+                            jobs.sort_by_key(|job| std::cmp::Reverse(severity(job)))
+                        }
+                        _ => jobs.sort_by_key(|job| severity(job)),
+                    }
+                }
+                QueueSort::NameAsc | QueueSort::NameDesc => {
+                    match sort {
+                        QueueSort::NameDesc => jobs.sort_by_key(|job| {
+                            std::cmp::Reverse(job.source_name().to_lowercase())
+                        }),
+                        _ => jobs.sort_by_key(|job| job.source_name().to_lowercase()),
+                    }
+                }
+            }
+
             let mut actions: Vec<RowAction> = Vec::new();
+
+            // A column sorts by cycling: arrival → ascending → descending →
+            // arrival. The third click means "put it back" and is worth the
+            // extra state over a two-state toggle that strands a sorted
+            // view at maximum. Directed arrows say which half is showing.
+            let name_arrow = match sort {
+                QueueSort::NameAsc => " ↑",
+                QueueSort::NameDesc => " ↓",
+                _ => "",
+            };
+            let state_arrow = match sort {
+                QueueSort::StateAsc => " ↑",
+                QueueSort::StateDesc => " ↓",
+                _ => "",
+            };
 
             TableBuilder::new(ui)
                 .vscroll(true)
@@ -329,10 +490,37 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
                 .column(Column::exact(32.0))
                 .header(24.0, |mut header| {
                     header.col(|ui| {
-                        ui.label("State");
+                        let button = ui
+                            .button(format!("State{state_arrow}"))
+                            .on_hover_text("Sort by state — failed first (click again to reverse)");
+                        // The arrow is the only visible sign of the sort
+                        // order; AccessKit gets the same fact in words, and
+                        // the same pattern is used for File below.
+                        ui.ctx().accesskit_node_builder(button.id, |node| {
+                            node.set_label(match sort {
+                                QueueSort::StateAsc => "State, sorted ascending: failed first. Activate to sort descending.",
+                                QueueSort::StateDesc => "State, sorted descending. Activate to return to arrival order.",
+                                _ => "State, unsorted. Activate to sort, failed documents first.",
+                            });
+                        });
+                        if button.clicked() {
+                            app.queue_sort = cycle_sort(sort, QueueSort::StateAsc);
+                        }
                     });
                     header.col(|ui| {
-                        ui.label("File");
+                        let button = ui
+                            .button(format!("File{name_arrow}"))
+                            .on_hover_text("Sort by file name (click again to reverse)");
+                        ui.ctx().accesskit_node_builder(button.id, |node| {
+                            node.set_label(match sort {
+                                QueueSort::NameAsc => "File, sorted ascending by name. Activate to sort descending.",
+                                QueueSort::NameDesc => "File, sorted descending by name. Activate to return to arrival order.",
+                                _ => "File, unsorted. Activate to sort by name, ascending.",
+                            });
+                        });
+                        if button.clicked() {
+                            app.queue_sort = cycle_sort(sort, QueueSort::NameAsc);
+                        }
                     });
                     header.col(|ui| {
                         ui.label("Format");
@@ -360,10 +548,17 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
                             });
 
                             row.col(|ui| {
-                                if ui
-                                    .selectable_label(selected == Some(job.id), job.source_name())
-                                    .clicked()
-                                {
+                                // Stem and extension survive a narrow cell;
+                                // the full path is one hover behind, and the
+                                // details tab holds it without hover at all.
+                                // `selectable_label` keeps the selected-row
+                                // highlight the plain label would lose.
+                                let name = job.source_name();
+                                let short = middle_ellipsis(&name, 48);
+                                let response =
+                                    ui.selectable_label(selected == Some(job.id), short)
+                                        .on_hover_text(job.source.display().to_string());
+                                if response.clicked() {
                                     action = Some(RowAction::Select(job.id));
                                 }
                             });
@@ -376,7 +571,7 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
                                 });
                             });
 
-                            row.col(|ui| progress_cell(ui, &job));
+                            row.col(|ui| progress_cell(ui, job));
 
                             row.col(|ui| {
                                 if let Some(e) = job.live_elapsed() {
@@ -397,9 +592,22 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
 
                             row.col(|ui| {
                                 if can_remove {
+                                    // 20 pt in height is the comfortable
+                                    // minimum for a click target; the old
+                                    // 18 pt button missed it.
                                     let btn = ui
-                                        .add_sized([24.0, 18.0], egui::Button::new("✕"))
+                                        .add_sized([24.0, 20.0], egui::Button::new("✕"))
                                         .on_hover_text("Remove from queue");
+                                    // The glyph is not a name: AccessKit gets
+                                    // the action and the document, so a
+                                    // screen reader never says
+                                    // "multiplication sign" and nothing else.
+                                    ui.ctx().accesskit_node_builder(btn.id, |node| {
+                                        node.set_label(format!(
+                                            "Remove {} from the queue",
+                                            job.source_name()
+                                        ));
+                                    });
                                     if btn.clicked() {
                                         action = Some(RowAction::Remove(job.id));
                                     }
@@ -425,6 +633,21 @@ pub fn draw_queue_panel(app: &mut App, ui: &mut egui::Ui) {
                 }
             }
         });
+}
+
+/// One click of a sortable header: unsorted → ascending → descending →
+/// unsorted, per column.
+fn cycle_sort(current: QueueSort, asc: QueueSort) -> QueueSort {
+    let (desc, next) = match asc {
+        QueueSort::StateAsc => (QueueSort::StateDesc, QueueSort::Arrival),
+        QueueSort::NameAsc => (QueueSort::NameDesc, QueueSort::Arrival),
+        _ => return QueueSort::Arrival,
+    };
+    match current {
+        s if s == asc => desc,
+        s if s == desc => next,
+        _ => asc,
+    }
 }
 
 fn source_ext(path: &std::path::Path) -> String {
@@ -506,7 +729,7 @@ pub fn draw_central(app: &mut App, ui: &mut egui::Ui) {
             });
         } else {
             ui.centered_and_justified(|ui| {
-                ui.weak("Tip: click a job to see its details in the bottom panel.");
+                ui.weak("Drop more documents here to add them.");
             });
         }
     });
@@ -543,20 +766,25 @@ pub fn draw_bottom_tabs(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
             ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| match app.bottom_tab {
-                    BottomTab::Details => draw_details(app, ui),
-                    BottomTab::Log => draw_log(app, ui),
-                    BottomTab::Warnings => draw_warnings(app, ui),
-                });
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink(false);
+            // The log appends at the bottom; follow the tail the way a
+            // console does. egui re-sticks when the reader scrolls back down,
+            // so reading older lines is never fought by the follow.
+            if app.bottom_tab == BottomTab::Log {
+                scroll = scroll.stick_to_bottom(true);
+            }
+            scroll.show(ui, |ui| match app.bottom_tab {
+                BottomTab::Details => draw_details(app, ui),
+                BottomTab::Log => draw_log(app, ui),
+                BottomTab::Warnings => draw_warnings(app, ui),
+            });
         });
 }
 
 fn draw_details(app: &App, ui: &mut egui::Ui) {
     let Some(job) = app.selected.and_then(|id| app.queue.job(id)) else {
-        ui.weak("Click a job in the queue to see its details here.");
-        ui.weak("Warnings and errors accumulate per job: they are shown here and in the console.");
+        ui.weak("Click a document in the queue to see its details here.");
+        ui.weak("Warnings and errors accumulate per document; they appear here and in the Log tab.");
         return;
     };
     let job = job.clone();
@@ -565,7 +793,9 @@ fn draw_details(app: &App, ui: &mut egui::Ui) {
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
             ui.strong("File");
-            ui.label(job.source.display().to_string());
+            // Selectable: paths get copied into other tools far more often
+            // than they get read twice.
+            ui.add(egui::Label::new(job.source.display().to_string()).selectable(true));
             ui.end_row();
 
             ui.strong("Target");
@@ -574,13 +804,29 @@ fn draw_details(app: &App, ui: &mut egui::Ui) {
 
             ui.strong("Output");
             match &job.output {
-                Some(out) => ui.label(out.display().to_string()),
-                None => ui.weak("— (resolved when the batch starts)"),
-            };
+                Some(out) => {
+                    // Wrapped: a long path plus the button would otherwise
+                    // push the button off the panel's right edge.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(egui::Label::new(out.display().to_string()).selectable(true));
+                        // Only once the file is on disk: a resolved name is
+                        // not a written file, and a button that opens an
+                        // empty folder is worse than no button.
+                        if out.exists() && ui.button("Open folder").clicked() {
+                            crate::app::App::reveal_in_explorer(out);
+                        }
+                    });
+                }
+                None => {
+                    ui.weak("— (resolved when the batch starts)");
+                }
+            }
             ui.end_row();
 
             ui.strong("State");
-            ui.label(job.status.label());
+            // Same colour as the queue's badge, so the two views of one fact
+            // cannot disagree.
+            ui.colored_label(status_color(&job.status, ui), job.status.label());
             ui.end_row();
 
             if let Some(e) = job.elapsed {
@@ -598,8 +844,12 @@ fn draw_details(app: &App, ui: &mut egui::Ui) {
                 ui.end_row();
             }
             if let Some(detail) = &job.detail {
-                ui.strong("Detail");
-                ui.label(detail);
+                ui.strong(if job.status == JobStatus::Failed {
+                    "Error"
+                } else {
+                    "Detail"
+                });
+                ui.add(egui::Label::new(detail).selectable(true));
                 ui.end_row();
             }
         });
@@ -629,7 +879,7 @@ fn draw_log(app: &App, ui: &mut egui::Ui) {
 
 fn draw_warnings(app: &App, ui: &mut egui::Ui) {
     if app.warnings.is_empty() {
-        ui.weak("No warnings so far. Conversion warnings (lost hyphens, reordered text, …) appear here instead of staying silent about quality.");
+        ui.weak("No warnings yet. Conversion warnings — lost hyphens, reordered text — appear here.");
         return;
     }
     for w in app.warnings.iter().rev() {
@@ -641,40 +891,126 @@ pub fn draw_status_bar(app: &mut App, ui: &mut egui::Ui) {
     egui::Panel::bottom("status_bar")
         .exact_size(24.0)
         .show(ui, |ui| {
+            // Additive bookkeeping only: engine state lives in the top bar
+            // now (a bottom edge is the first thing a moved window hides),
+            // and the queue header stopped printing its own copy of these
+            // same numbers, so the counts read in exactly one place.
             ui.horizontal(|ui| {
                 let counts = app.counts();
-                let engine = if !app.engine_alive() {
-                    "engine: unavailable".to_owned()
-                } else if app.busy() {
-                    // The status bar deliberately does not name the engine
-                    // kind: production runs the worker-process pool and the
-                    // demo swap (one line in main.rs) must not lie either.
-                    format!(
-                        "engine: running ({} in flight, {} worker(s))",
-                        app.engine_in_flight(),
-                        app.settings.workers_or_default()
-                    )
-                } else {
-                    format!(
-                        "engine: idle ({} worker(s))",
-                        app.settings.workers_or_default()
-                    )
-                };
-                ui.weak(engine);
-                ui.separator();
                 ui.weak(format!(
-                    "{} job(s) · {} running · {} done · {} failed · {} warnings",
-                    counts.total,
+                    "{} · {} running · {} done · {} failed · {} warnings",
+                    plural(counts.total, "document"),
                     counts.running,
                     counts.done,
                     counts.failed,
                     app.warnings.len()
                 ));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("dconv-app");
-                });
             });
         });
+}
+
+// ---------------------------------------------------------------------------
+// The destructive confirmation
+// ---------------------------------------------------------------------------
+
+/// The one destructive step in the app: a start under the "Overwrite files"
+/// policy that would replace files already on disk. egui's `Modal` gives the
+/// backdrop that blocks the batch buttons underneath and consumes Escape
+/// (`should_close`), so the safe answer is reachable three ways — Cancel,
+/// Escape, backdrop — and the destructive one exactly once, disabled
+/// nowhere but never the default.
+pub fn draw_overwrite_confirm(app: &mut App, ui: &mut egui::Ui) {
+    if app.pending_confirm.is_none() {
+        return;
+    }
+
+    enum Choice {
+        None,
+        Proceed,
+        Cancel,
+    }
+    let mut choice = Choice::None;
+
+    let response = egui::Modal::new(egui::Id::unique("overwrite_confirm")).show(ui.ctx(), |ui| {
+        if let Some(pending) = app.pending_confirm.as_ref() {
+            ui.add_space(2.0);
+            ui.strong(format!(
+                "Overwrite {}?",
+                plural(pending.existing.len(), "existing file")
+            ));
+            ui.add_space(6.0);
+            // A few concrete names beat a number: the count says *how
+            // many*, the names say *what anyone loses* if they accept.
+            for output in pending.existing.iter().take(5) {
+                let name = output
+                    .file_name()
+                    .map_or_else(
+                        || output.display().to_string(),
+                        |n| n.to_string_lossy().to_string(),
+                    );
+                ui.label(middle_ellipsis(&name, 48));
+            }
+            if pending.existing.len() > 5 {
+                ui.weak(format!("… and {} more", pending.existing.len() - 5));
+            }
+            ui.add_space(6.0);
+            ui.weak(
+                "These files will be replaced by the converted documents. \\
+                 Cancel keeps the queue exactly as it is.",
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                // The safe button first, reading order: the wandering eye
+                // hits "Cancel" before it reaches the crimson one — and the
+                // Enter key (which the shortcuts handler suppresses while
+                // this dialog is up) can never fire the destructive label
+                // as a default. A warning button is prominent, not default.
+                let cancel = ui.button("Cancel");
+                let overwrite = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(format!(
+                            "Overwrite {}",
+                            pending.existing.len()
+                        ))
+                        .color(crate::theme::TEXT)
+                        .strong(),
+                    )
+                    .fill(crate::theme::CRIMSON),
+                );
+                // A modal owns the keyboard: if focus is anywhere else —
+                // the Start button that opened the dialog, or a widget Tab
+                // has wandered to behind the backdrop — the safe answer
+                // takes it. Tab then moves Cancel → Overwrite and the check
+                // brings it back, which is the focus trap a modal is
+                // supposed to have. Enter on Cancel dismisses; Enter can
+                // only overwrite after a deliberate Tab.
+                let focused_here = ui.memory(|memory| {
+                    memory.has_focus(cancel.id) || memory.has_focus(overwrite.id)
+                });
+                if !focused_here {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    choice = Choice::Cancel;
+                }
+                if overwrite.clicked() {
+                    choice = Choice::Proceed;
+                }
+            });
+        }
+    });
+
+    // Backdrop click and Escape both mean "no": a destructive action is the
+    // one place dismissing without choosing must not default to yes.
+    if response.should_close() {
+        choice = Choice::Cancel;
+    }
+
+    match choice {
+        Choice::Proceed => app.confirm_overwrite(),
+        Choice::Cancel => app.cancel_overwrite_confirm(),
+        Choice::None => {}
+    }
 }
 
 impl App {

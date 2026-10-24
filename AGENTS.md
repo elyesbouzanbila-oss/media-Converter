@@ -354,14 +354,18 @@ PDFium once and processes JSON lines from stdin; the parent streams the queue
 into the children and owns the kill, removing a killed child's half-written
 output so a cancelled job never leaves a broken document behind. Every child
 job is guaranteed a terminal event, so the UI's in-flight counter cannot strand.
+Files named on the command line — "Open with dconvert", or a selection dropped
+onto the executable — are handed to `App::add_files` on launch, the same path
+the pickers use, so they get the same readable check and the same log lines.
 
-Format honesty: the settings list and the accepted extensions come from
-`engine::supported(ext)` / `readable(path)`, which delegate to the facade's
-capability query. The one hand-written piece is the facade-format →
-`TargetFormat` mapping (`target_of`), and it is an **exhaustive `match` on
-purpose**: when the facade learns a target the UI does not name, `app` fails to
-compile there and the UI owner classifies it — a new format can neither silently
-fail nor silently stay hidden.
+Format honesty: the settings list, the accepted extensions and the file
+picker's filter come from `engine::supported(ext)`, `readable(path)` and
+`readable_extensions()`, which delegate to the facade's capability query. The
+one hand-written piece is the facade-format → `TargetFormat` mapping
+(`target_of`), and it is an **exhaustive `match` on purpose**: when the facade
+learns a target the UI does not name, `app` fails to compile there and the UI
+owner classifies it — a new format can neither silently fail nor silently stay
+hidden.
 
 ### The frozen protocol
 
@@ -550,27 +554,24 @@ goldens, the GUI with its real engine, packaging, and CI.
 deliberately names no commit hashes, because a hash in a document goes stale
 the moment anyone commits.
 
-**Tests:** 115 — `dconv-ir` 17, `dconv-pdf` 45 (38 geometry, plus the seven
+**Tests:** 117 — `dconv-ir` 17, `dconv-pdf` 46 (39 geometry, plus the seven
 bind tests), `dconv-docx` 12, `dconv-engine` 9 (eight unit, plus the end-to-end
 golden run), `dconv-cli` 9 (seven unit, plus two end-to-end pool runs: pooled
-vs serial vs goldens), `dconv-app` 23 (ten queue/settings, two log, eight
+vs serial vs goldens), `dconv-app` 24 (ten queue/settings, two log, nine
 engine protocol, two palette-contrast, plus the worker-vs-golden run in
 `app/tests/`, which skips on a tree that lacks a fetched `pdfium.dll`).
 
 **Known gaps, in the order they are worth doing:**
 
-1. **Multi-column reading order** — a remaining block of the 76 differing
-   tokens on the second document. Text is read *across* the columns instead of
-   down each one: page 3's script list beside the account table (the corrected
-   diagnosis is in `docs/phase0-findings.md`). The fix is to split a
-   page into vertical strips at an x-interval no segment's ink crosses, when at
-   least two bands straddle it *and* both sides carry a real share of the content
-   width — the second test is what rejects the table's own internal gutters
-   (measured at [501.20, 521.77]). MuPDF reads page 3 as the whole left list and
-   then the table, which is the model to match. `Region::Columns` (the
-   two-column page) is a different split and stays as it is. `columns.pdf`'s
-   golden pins the current, wrong behaviour on purpose. The rest of the 76 is
-   the page header/footer segment order and the dropped `U+0002` hyphens.
+1. **Two-column reading order** — the page-3 script-list/account-table case is
+   fixed: the cut pass takes the list/table boundary at 366.88 rather than the
+   table's internal header gutter at 424.27, the table keeps its marker column,
+   and it reads 3x3 (`docs/phase0-findings.md`, D17). What remains is the
+   general `Region::Columns` two-column page, whose `columns.pdf` golden still
+   pins the across-columns behaviour on purpose. MuPDF's page-3 block order also
+   puts the table after the whole page flow, so the order-sensitive WER still
+   counts the table block as moved; the rest of TP2's 76 is the page
+   header/footer segment order and the dropped `U+0002` hyphens.
 2. **A fully ruled table with exactly two rows** — the rule-based grouping
    needs two internal rules before absence of a rule between bands means "same
    row", because a table that rules only its header would otherwise merge its

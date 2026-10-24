@@ -30,7 +30,9 @@
 //! the UI's threading assumptions — which is now how it actually runs.
 
 use crate::state::{JobId, TargetFormat};
-use dconv_engine::{Converter, EngineError, Format, PdfError, ReadStats, all_targets, targets_for};
+use dconv_engine::{
+    Converter, EngineError, Format, PdfError, ReadStats, all_targets, readers, targets_for,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -150,6 +152,19 @@ pub fn readable(path: &Path) -> bool {
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
     !supported(&ext).is_empty()
+}
+
+/// Every extension the engine reads, straight from the facade's reader list —
+/// what the file dialog filters on. The same argument as `supported_targets`,
+/// applied to inputs: a reader landing in `CONVERSIONS` reaches the picker
+/// with no UI change, so the dialog can never hide a format the queue would
+/// accept (the "All files" escape hatch exists, and `add_files` still filters
+/// with `readable`).
+pub fn readable_extensions() -> Vec<&'static str> {
+    readers()
+        .into_iter()
+        .map(|format| format.extension())
+        .collect()
 }
 
 /// Facade format → settings value, an *exhaustive* match on purpose. A
@@ -1220,6 +1235,30 @@ mod tests {
         assert!(supported("docx").is_empty());
         assert!(supported("txt").is_empty());
         assert!(supported("").is_empty());
+    }
+
+    #[test]
+    fn the_file_dialog_offers_exactly_what_the_queue_accepts() {
+        // The dialog filter and `readable` both come from the facade; this
+        // asserts they agree, because a filter narrower than `readable`
+        // hides accepted files and a wider one hands the queue files it
+        // will only bounce.
+        let extensions = readable_extensions();
+        assert!(
+            !extensions.is_empty(),
+            "a picker with no filters would make the common case (choose a document) impossible"
+        );
+        for extension in &extensions {
+            let probe = std::path::PathBuf::from(format!("report.{extension}"));
+            assert!(
+                readable(&probe),
+                "the dialog offers .{extension} but the queue would reject it"
+            );
+        }
+        assert!(
+            extensions.contains(&"pdf"),
+            "the one committed reader must reach the picker: {extensions:?}"
+        );
     }
 
     #[test]

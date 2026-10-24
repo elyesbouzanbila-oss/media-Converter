@@ -35,15 +35,28 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Files named on the command line queue on launch: "Open with
+    // dconvert" and dropping a selection onto the executable both arrive
+    // this way. Unreadable ones are filtered by `App::add_files`, which
+    // logs why rather than refusing to start. The worker flag never reaches
+    // here (it returns above).
+    let initial_files: Vec<std::path::PathBuf> =
+        std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
+
     eframe::run_native(
-        "dconvert — document converter",
+        // The pre-frame title; the app rewrites it from its content every
+        // frame after (app.rs › update_window_title). The tagline stayed
+        // here only until the first frame in earlier builds.
+        "dconvert",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // The log ring is created before the engine so tracing output from
             // either side lands in the same ring from the very first frame.
             let log = log_ring::install_tracing();
             let engine = engine::spawn_real_engine();
-            Ok(Box::new(app::App::new(cc, log, engine)))
+            let mut app = app::App::new(cc, log, engine);
+            app.add_files(initial_files);
+            Ok(Box::new(app))
         }),
     )
 }

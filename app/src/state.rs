@@ -86,7 +86,6 @@ pub struct Settings {
     pub overwrite: OverwritePolicy,
     /// Worker processes for the conversion pool. See [`default_worker_count`].
     pub workers: u32,
-    pub dark_theme: bool,
 }
 
 impl Default for Settings {
@@ -97,7 +96,6 @@ impl Default for Settings {
             target: TargetFormat::Docx,
             overwrite: OverwritePolicy::AutoRename,
             workers: default_worker_count() as u32,
-            dark_theme: true,
         }
     }
 }
@@ -217,12 +215,6 @@ pub struct Counts {
     pub done: usize,
     pub failed: usize,
     pub cancelled: usize,
-}
-
-impl Counts {
-    pub fn busy(&self) -> bool {
-        self.queued > 0 || self.running > 0
-    }
 }
 
 #[derive(Debug, Default)]
@@ -396,6 +388,26 @@ pub fn resolve_output_path(
     Some(candidate)
 }
 
+/// The outputs of `sources` that already exist on disk, under this
+/// settings' output mode and overwrite policy — what the Start action warns
+/// with before "Overwrite files" is allowed to clobber anything.
+///
+/// It resolves with a fresh `taken` set exactly the way `start_batch` does
+/// (which is why it lives beside [`resolve_output_path`]): the returned
+/// names are the names the engine will be told to write, so a collision
+/// here is a collision the batch would actually hit, not an approximation.
+pub fn existing_outputs(
+    settings: &Settings,
+    sources: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
+    let mut taken = HashSet::new();
+    sources
+        .into_iter()
+        .filter_map(|source| resolve_output_path(settings, &source, &mut taken))
+        .filter(|output| output.exists())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Drag & drop helpers
 // ---------------------------------------------------------------------------
@@ -555,11 +567,43 @@ mod tests {
             TargetFormat::Docx,
         );
         let queued = q.counts();
-        assert!(queued.busy());
+        assert_eq!(queued.queued, 2, "nothing has started yet");
         q.job_mut(ids[0]).unwrap().status = JobStatus::Running;
         q.job_mut(ids[0]).unwrap().progress = Some(0.5);
         let p = q.batch_progress().unwrap();
         assert!((p - 0.25).abs() < 1e-6, "got {p}");
+    }
+
+    #[test]
+    fn overwrite_collision_count_reports_only_existing_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        // One target already on disk from an earlier run.
+        std::fs::write(dir.path().join("first.docx"), b"x").unwrap();
+        let settings = Settings {
+            output_mode: OutputMode::Custom,
+            custom_dir: Some(dir.path().to_path_buf()),
+            ..Settings::default()
+        };
+        let sources = vec![
+            PathBuf::from("C:/u/first.pdf"),
+            PathBuf::from("C:/u/second.pdf"),
+        ];
+
+        // Under Overwrite, `first.pdf` resolves onto the file that exists.
+        let mut overwrite = settings.clone();
+        overwrite.overwrite = OverwritePolicy::Overwrite;
+        let existing = existing_outputs(&overwrite, sources.clone());
+        assert_eq!(existing.len(), 1, "exactly the existing file counts");
+        assert!(
+            existing.first().unwrap().ends_with("first.docx"),
+            "the one existing path, {existing:?}"
+        );
+
+        // Under AutoRename the same batch resolves around it — nothing to warn about.
+        assert!(
+            existing_outputs(&settings, sources).is_empty(),
+            "auto-rename resolves around what exists on disk"
+        );
     }
 
     #[test]
