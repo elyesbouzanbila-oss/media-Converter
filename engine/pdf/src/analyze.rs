@@ -728,7 +728,13 @@ fn monospace(segment: &Segment) -> bool {
 /// gap produce identical pieces (every character boundary is fixed), so the
 /// choice only has to prefer the window whose bands sit nearest the scan
 /// point — keep an incumbent unless a newcomer opens earlier (or, from the
-/// same first band, runs wider).
+/// same first band, runs wider). Equal windows prefer the smaller cut: when
+/// both the table's internal gutter and the list/table boundary clear every
+/// band, the boundary that leaves the table's first column on the table side
+/// is the one that reads the table whole. Page 3 of `TP2 Admin BD 2026_2027.pdf`
+/// is the measured case — the header's `Numcpte|Titulaire` gutter at 424.27 and
+/// the list/table gap at 366.88 both admit the same window, and the larger cut
+/// hides the marker column in the list.
 fn best_strip(bands: &[Band], scan: usize) -> Option<StripPlan> {
     let mut best: Option<StripPlan> = None;
 
@@ -762,9 +768,13 @@ fn better_strip(previous: &StripPlan, plan: &StripPlan) -> bool {
     // above another one belongs to a different, smaller block — page 4's
     // 5.1 table [1..5) — and must not wait behind a wider later window
     // [10..16) whose only claim is reach. Equal starts adopt the wider
-    // reach; equal windows keep the first evaluated.
+    // reach; equal windows prefer the smaller cut, so a table's internal
+    // gutter cannot hide its first column in the stream beside it.
     plan.start < previous.start
         || (plan.start == previous.start && plan.end > previous.end)
+        || (plan.start == previous.start
+            && plan.end == previous.end
+            && plan.cut < previous.cut)
 }
 
 /// Evaluate one candidate cut: walk the bands from `scan` while they admit it,
@@ -1509,6 +1519,16 @@ fn build_table(
     rules: &[Rule],
 ) -> Block {
     let tolerance = run_tolerance(&bands[start..end]);
+    // A header cell can be one text run covering two columns: the account
+    // table's `Numcpte Titulaire` is a single segment from 372.72 to 470.59,
+    // although the body rows put `Numcpte` at 372.72 and `Titulaire` at 429.33.
+    // Splitting at the recorded gap before the next column keeps the header
+    // cells on the columns the body established. Without this the whole header
+    // lands in the first cell and the second header cell is empty.
+    let split = split_merged_cells(&bands[start..end], columns, tolerance);
+    let bands = split.as_slice();
+    let start = 0;
+    let end = bands.len();
     let internal = table_rules(bands, start, end, rules);
     let ruled = internal.len() >= MIN_INTERNAL_RULES;
     let mut grouped: Vec<Vec<Vec<Inline>>> = Vec::new();
@@ -1527,10 +1547,19 @@ fn build_table(
             // separates a row whose every cell wraps from two rows: both lines
             // fill the same columns, so the subset test cannot.
             Some(upper) if ruled => {
+                // The row's baseline is the dominant one, not the lowest
+                // glyph's. The account table's marker column is set lower than
+                // the row's text: marker `2` sits at 689.07 while `Sami
+                // TRABELSI` and `2000` sit at 693.87, and the row rule at
+                // 689.77 is above the marker but below the text. Reading the
+                // band's minimum bottom made that rule invisible and merged
+                // rows 2 and 3. Weighting by characters keeps the one-glyph
+                // marker from outvoting the cells it labels.
+                let upper_bottom = dominant_bottom(&upper.segments);
                 subset
                     && !internal
                         .iter()
-                        .any(|rule| rule.y < upper.bottom && rule.y > band.top)
+                        .any(|rule| rule.y < upper_bottom && rule.y > band.top)
             }
             // A table with no internal rulings still has wrapped cells: a tail
             // band fills fewer columns than its row's first line.
@@ -1591,6 +1620,69 @@ fn build_table(
         rows,
         borders: Default::default(),
     })
+}
+
+/// Split a text run that covers more than one of the table's columns.
+///
+/// The split happens at the run's own recorded gap just before the next
+/// column, so the characters and their x positions stay together. A run that
+/// merely ends within the column tolerance is left alone: that is a cell whose
+/// text is a little wider than its column, not two cells.
+fn split_merged_cells(bands: &[Band], columns: &[f32], tolerance: f32) -> Vec<Band> {
+    bands
+        .iter()
+        .map(|band| {
+            let mut segments = Vec::new();
+
+            for segment in &band.segments {
+                let mut pieces = vec![segment.clone()];
+                for &column in columns {
+                    let mut next = Vec::new();
+                    for piece in pieces {
+                        let crosses =
+                            piece.left + tolerance < column && piece.right > column + tolerance;
+                        if !crosses {
+                            next.push(piece);
+                            continue;
+                        }
+
+                        let gap = piece
+                            .gaps
+                            .iter()
+                            .copied()
+                            .filter(|&(right, width)| {
+                                right < column && right + width >= column - 0.5
+                            })
+                            .max_by(|a, b| a.0.total_cmp(&b.0));
+                        let Some((right, width)) = gap else {
+                            next.push(piece);
+                            continue;
+                        };
+
+                        match cut_segment(&piece, right + width * 0.5) {
+                            Some((left, right)) => {
+                                if let Some(left) = left {
+                                    next.push(left);
+                                }
+                                if let Some(right) = right {
+                                    next.push(right);
+                                }
+                            }
+                            None => next.push(piece),
+                        }
+                    }
+                    pieces = next;
+                }
+                segments.extend(pieces);
+            }
+
+            Band {
+                segments,
+                bottom: band.bottom,
+                top: band.top,
+            }
+        })
+        .collect()
 }
 
 /// The rules that can bound a row of this table: inside its vertical extent and
@@ -1670,6 +1762,30 @@ fn run_inline(run: &Run) -> Inline {
     })
 }
 
+/// The baseline most of a band's text sits on, weighted by character count.
+///
+/// Table cells do not always share a baseline: a row-number cell may be set
+/// lower than the prose beside it. A row boundary is a fact about the row's
+/// text, so the one-glyph marker must not decide it.
+fn dominant_bottom(segments: &[Segment]) -> f32 {
+    let mut buckets: Vec<(i32, usize)> = Vec::new();
+
+    for segment in segments {
+        let key = (segment.bottom * 4.0).round() as i32;
+        let weight = segment.char_count().max(1);
+        match buckets.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, total)) => *total += weight,
+            None => buckets.push((key, weight)),
+        }
+    }
+
+    buckets
+        .into_iter()
+        .max_by_key(|(key, count)| (*count, *key))
+        .map(|(key, _)| key as f32 / 4.0)
+        .unwrap_or_else(|| segments.iter().map(|s| s.bottom).fold(f32::INFINITY, f32::min))
+}
+
 /// A band's size, weighted by how much text carries each size.
 fn weighted_size(segments: &[Segment]) -> f32 {
     let mut buckets: Vec<(i32, usize)> = Vec::new();
@@ -1736,6 +1852,18 @@ mod tests {
             if ch == ' ' {
                 x += size * 0.1;
             }
+        }
+        out
+    }
+
+    /// Place separate words at explicit origins without space glyphs, so the
+    /// bander records the inter-word gaps the cut pass needs. This is the shape
+    /// the account table's list line and its marker column have in the PDF: the
+    /// producer omitted the space glyph and the next piece starts at its own x.
+    fn fused_words(words: &[(&str, f32)], size: f32, y: f32, bold: bool) -> Vec<Glyph> {
+        let mut out = Vec::new();
+        for (text, origin) in words {
+            out.extend(line(text, size, y, *origin, bold));
         }
         out
     }
@@ -2178,6 +2306,179 @@ mod tests {
             !blocks.iter().any(|b| matches!(b, Block::Table(_))),
             "two bands that share an x are not a table: {blocks:#?}"
         );
+    }
+
+    #[test]
+    fn the_account_tables_marker_column_stays_with_the_table() {
+        // Page 3 of `TP2 Admin BD 2026_2027.pdf`, at its measured positions.
+        // The header runs `Numcpte Titulaire` as one segment across the table's
+        // internal gutter (gap 419.22..429.33, cut 424.27), and the list's
+        // second line runs into the row marker `1` (gap 361.05..372.72, cut
+        // 366.88). Both cuts clear every band and open the same window, so the
+        // old first-evaluated tie-break took the header gutter and left the
+        // marker column on the list side: the table read two columns and the
+        // list read `... numcpte 1`. The smaller cut is the list/table
+        // boundary and keeps `1`/`2`/`3` with the table.
+        let mut glyphs = Vec::new();
+        glyphs.extend(line(
+            "Supprime la table Compte si elle existe déjà",
+            11.0,
+            730.07,
+            60.62,
+            false,
+        ));
+        // The header is one segment, not two: the real `Numcpte` advances to
+        // 419.217, leaving a 10.113pt gap to `Titulaire`, which is below the
+        // 17.6pt column gap. The test helper's 5.5pt advance would leave 18.11pt
+        // and the bander would split the header before the table saw it.
+        let mut header = line("Numcpte", 11.0, 734.28, 372.72, true);
+        header.last_mut().expect("header").right = 419.217;
+        glyphs.extend(header);
+        glyphs.extend(line("Titulaire", 11.0, 734.28, 429.33, true));
+        glyphs.extend(line("Solde", 11.0, 734.28, 521.77, true));
+        glyphs.extend(fused_words(
+            &[
+                ("•", 60.62),
+                ("Crée", 78.62),
+                ("la", 110.41),
+                ("table", 128.19),
+                ("Compte", 161.37),
+                ("avec", 208.92),
+                ("les", 240.10),
+                ("colonnes", 263.08),
+                // `line` advances 5.5pt per character; the extra `;` makes the
+                // word wide enough that the marker gap stays under the bander's
+                // 1.6em column threshold, as the real 11.67pt gap does.
+                ("numcpte;", 315.85),
+            ],
+            11.0,
+            714.47,
+            false,
+        ));
+        // The real marker is 5.87pt wide; `line` would make it exactly the
+        // 5.5pt minimum piece and floating-point rounding could refuse the
+        // cut. Use the measured right edge.
+        glyphs.push(glyph('1', 11.0, 372.72, 378.59, 714.47, false));
+        glyphs.extend(line("Ali BEN SALAH", 11.0, 714.47, 429.33, false));
+        glyphs.extend(line("1000", 11.0, 714.47, 521.77, false));
+        glyphs.extend(line(
+            "(numérique sur 5 chiffres, clé primaire), titulaire",
+            11.0,
+            702.47,
+            78.62,
+            false,
+        ));
+        // The real row marker is set 4.8pt below its row's text; the rule at
+        // 689.77 is above the marker but below the text. The band's minimum
+        // bottom is 689.07, the dominant text bottom is 693.87, and the rule
+        // at 689.77 must still end the row.
+        glyphs.extend(line("2", 11.0, 689.07, 372.72, false));
+        glyphs.extend(line("Sami TRABELSI", 11.0, 693.87, 429.33, false));
+        glyphs.extend(line("2000", 11.0, 693.87, 521.77, false));
+        glyphs.extend(line(
+            "• Iinsère les 3 comptes du tableau ;",
+            11.0,
+            673.87,
+            60.62,
+            false,
+        ));
+        glyphs.extend(line("3", 11.0, 673.87, 372.72, false));
+        glyphs.extend(line("Nadia KHALIL", 11.0, 673.87, 429.33, false));
+        glyphs.extend(line("1500", 11.0, 673.87, 521.77, false));
+        glyphs.extend(line("• Valide la transaction ;", 11.0, 660.0, 60.62, false));
+        glyphs.extend(line(
+            "• Affiche le contenu final de la table.",
+            11.0,
+            646.0,
+            60.62,
+            false,
+        ));
+        glyphs.extend(line(
+            "3. Contrôle transactionnel de base",
+            13.0,
+            620.0,
+            42.62,
+            false,
+        ));
+
+        // The account table's horizontal borders, at the measured x extent and
+        // the row boundaries used above. The outer two only define the table's
+        // vertical extent; the three inner ones are the row boundaries.
+        let rules = vec![
+            Rule {
+                x0: 368.33,
+                x1: 566.18,
+                y: 750.17,
+                thickness: 0.4,
+            },
+            Rule {
+                x0: 368.33,
+                x1: 566.18,
+                y: 730.17,
+                thickness: 0.4,
+            },
+            Rule {
+                x0: 368.33,
+                x1: 566.18,
+                y: 709.58,
+                thickness: 0.4,
+            },
+            Rule {
+                x0: 368.33,
+                x1: 566.18,
+                y: 689.77,
+                thickness: 0.4,
+            },
+            Rule {
+                x0: 368.33,
+                x1: 566.18,
+                y: 669.55,
+                thickness: 0.4,
+            },
+        ];
+
+        let (bands, profile) = document_of(vec![glyphs]);
+
+        let (_, windows) = cut_columns(&bands[0]);
+        let (start, window) = windows
+            .iter()
+            .find(|(_, window)| window.cut.is_some())
+            .expect("the page-3 strip window");
+        assert_eq!(*start, 0, "{windows:#?}");
+        let cut = window.cut.expect("a stream cut");
+        assert!(
+            cut > 361.0 && cut < 372.72,
+            "the cut must be the list/table gap 361.05..372.72, not the header gutter at 424.27: {cut}"
+        );
+
+        let blocks = build_page(&bands[0], &rules, &profile, &page());
+        let table_index = blocks
+            .iter()
+            .position(|block| matches!(block, Block::Table(_)))
+            .expect("the account table");
+        let heading_index = blocks
+            .iter()
+            .position(|block| matches!(block, Block::Heading { .. }))
+            .expect("the heading after the table");
+        assert!(
+            table_index < heading_index,
+            "the table belongs before the heading below it: {blocks:#?}"
+        );
+
+        let Block::Table(table) = &blocks[table_index] else {
+            unreachable!()
+        };
+        assert_eq!(table.column_count(), 3, "{table:#?}");
+        assert_eq!(table.rows.len(), 4, "{table:#?}");
+
+        let header: Vec<String> = table.rows[0].cells.iter().map(cell_text).collect();
+        assert_eq!(header, vec!["Numcpte", "Titulaire", "Solde"], "{table:#?}");
+        let first: Vec<String> = table.rows[1].cells.iter().map(cell_text).collect();
+        assert_eq!(first, vec!["1", "Ali BEN SALAH", "1000"], "{table:#?}");
+        let second: Vec<String> = table.rows[2].cells.iter().map(cell_text).collect();
+        assert_eq!(second, vec!["2", "Sami TRABELSI", "2000"], "{table:#?}");
+        let third: Vec<String> = table.rows[3].cells.iter().map(cell_text).collect();
+        assert_eq!(third, vec!["3", "Nadia KHALIL", "1500"], "{table:#?}");
     }
 
     #[test]

@@ -4,7 +4,7 @@
   <a href="#licences"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <img alt="Rust 1.92+" src="https://img.shields.io/badge/rust-1.92%2B-orange.svg?logo=rust&logoColor=white">
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-windows-lightgrey.svg?logo=windows&logoColor=white">
-  <img alt="Version: 0.1.0-alpha.3" src="https://img.shields.io/badge/version-0.1.0--alpha.3-orange.svg">
+  <img alt="Version: 0.1.0-alpha.4" src="https://img.shields.io/badge/version-0.1.0--alpha.4-orange.svg">
   <img alt="Status: in development" src="https://img.shields.io/badge/status-in%20development-orange.svg">
 </p>
 
@@ -22,11 +22,11 @@ byte-identical output.
 > [!NOTE]
 > **Ongoing development**
 > The PDF reader, DOCX writer, engine facade, CLI, GUI and packaging step all
-> work, and the workspace's 115 tests pass. Input formats beyond PDF and targets
+> work, and the workspace's 117 tests pass. Input formats beyond PDF and targets
 > beyond DOCX are planned.
 
 > [!NOTE]
-> **Status: in development (`0.1.0-alpha.3`)**
+> **Status: in development (`0.1.0-alpha.4`)**
 > This is early software. Command-line flags, the GUI's settings format and the
 > shape of the Doc IR may change between versions, without a compatibility
 > guarantee.
@@ -253,7 +253,7 @@ with MuPDF (PyMuPDF), an independent implementation:
 | Document | Pages | Word error | Similarity | Missing | Extra |
 | --- | --- | --- | --- | --- | --- |
 | `3IRS_TP2.pdf` | 5 | **1.28 %** | 99.21 % | 1 | 1 |
-| `TP2 Admin BD 2026_2027.pdf` | 6 | 6.92 % | 96.34 % | 3 | 3 |
+| `TP2 Admin BD 2026_2027.pdf` | 6 | **3.76 %** | 97.92 % | 3 | 3 |
 
 Missing and extra tokens are the order-independent measure and are the honest
 one; word error rate depends on MuPDF's own block order, which is not guaranteed
@@ -268,15 +268,19 @@ small generated documents that pin bytes end to end.
 
 ## Known limitations
 
-- **Multi-column reading order.** Text is read across columns instead of down
-  each one on multi-column pages. This is the largest fidelity gap, and
-  `columns.pdf`'s golden pins the current behaviour on purpose.
-- **Fully wrapped table rows.** When every cell of a row wraps, the second line
-  fills exactly the same columns as the first; without reading the rulings there
-  is nothing geometric left to tell it from a second row.
-- **Heading inference.** Size alone cannot distinguish a 12 pt note box from a
-  heading in an 11 pt document, so some emphasis becomes spurious headings. It
-  costs no text.
+- **Multi-column reading order.** Two-column pages are still read across the
+  columns instead of down each one; `columns.pdf`'s golden pins that behaviour
+  on purpose. The page-3 script list beside the account table is now cut at the
+  list/table boundary, so the list is read whole before the table and the table
+  keeps its marker column.
+- **A fully ruled table with exactly two rows.** The rule-based grouping needs
+  two internal rules before absence of a rule between bands means "same row"; a
+  two-row table has one, so an every-cell-wrapped row can still split. A
+  producer that draws the whole grid as one path object has no thin edge to
+  read.
+- **Heading inference.** It uses size plus space above, which keeps a 12 pt note
+  out of an 11 pt body; emphasis that is both larger and spaced like a heading
+  can still become a spurious heading. It costs no text.
 - **No de-hyphenation.** Joining a trailing hyphen wrongly would corrupt two
   words where an omission is a visible gap.
 - **Dropped code points are reported, never guessed.** The CLI prints a
@@ -295,8 +299,8 @@ small generated documents that pin bytes end to end.
 | 1 | Facade, `dconv` CLI, fidelity harnesses | ✅ |
 | 2 | `dconvert` GUI, worker-process pools, packaging | ✅ |
 | 3 | Multi-column reading order | ⬜ |
-| 4 | Table rows whose every cell wraps (read the rulings) | ⬜ |
-| 5 | Heading inference from spacing, not size alone | ⬜ |
+| 4 | Table rows whose every cell wraps (read the rulings) | ✅ |
+| 5 | Heading inference from spacing, not size alone | ✅ |
 | 6 | More readers and writers: DOCX, PPTX, XLSX, ODT, HTML, MD, TXT | ⬜ |
 | 7 | An ETA in the GUI's top bar, from per-page progress | ⬜ |
 | 8 | Superscript bounds compared on baselines, not box bottoms | ⬜ |

@@ -674,3 +674,55 @@ and shading rejected, the 0.4pt column gap merges, a 5pt gap does not);
 real rules, 5.2's one-sided `[B2]` row kept apart by its rule, and a header-only
 rule that must not license merging.
 
+## Finding D17 - the page-3 cut is the list/table boundary, not the table's first gutter
+
+Page 3 of `TP2 Admin BD 2026_2027.pdf` puts the SQL script list on the left and
+the account table on the right. Two cuts both clear every band and open the same
+window:
+
+- `419.217..429.33`, the `Numcpte|Titulaire` gutter inside the table (cut
+  424.27);
+- `361.049..372.72`, the gap between the list's `numcpte` and the row marker
+  `1` (cut 366.88).
+
+The old tie-break kept the first evaluated, so it took the header gutter. That
+put `Numcpte` on the list side and `1`/`2`/`3` inside the list lines, and the
+right strip read as a two-column table `Titulaire | Solde`. The smaller cut is
+the actual boundary: the table's first column (`Numcpte` at 372.72, `1` at
+372.72, ...) belongs with the table. `better_strip` now prefers the smaller cut
+when start and end are equal. The share gate still rejects the `Solde` gutter at
+`501.20..521.77` (5.9% of the page width), so the table's internal
+`Titulaire|Solde` split is not a page cut.
+
+Two supporting facts were needed to make the right strip read as a table, not
+just a two-column stream:
+
+- The row-number cells are set lower than the row's prose. Marker `2` sits at
+  689.07 while `Sami TRABELSI` and `2000` sit at 693.87; the row rule at 689.77
+  is above the marker but below the text. `dominant_bottom` weights by
+  character count, so the one-glyph marker cannot decide that the rule is
+  outside the row. The header band has the same shape: its segments sit at
+  734.28 while the list line on the other side of the cut sits at 730.07, so
+  the header rule at 730.17 is below the header text but above row 1.
+  Rows 2 and 3 no longer merge, and the header no longer merges into row 1.
+- The header `Numcpte Titulaire` is one segment 372.72..470.59 crossing the
+  internal gutter at 429.33. `split_merged_cells` splits a run at the recorded
+  gap just before the next column; the table is now 3x3 with header
+  `Numcpte | Titulaire | Solde` and rows `1 Ali ... 1000`,
+  `2 Sami ... 2000`, `3 Nadia ... 1500`.
+
+Measured: the page-3 list no longer carries `Numcpte`/`1`/`2`/`3`; the table is
+3 columns and 4 rows. TP2 remains **3.76%** (76/2022, similarity 97.92%),
+missing/extra unchanged 3/3, because MuPDF's content-stream block order puts the
+table after the whole page flow (the heading and exercises below it), while the
+converter reads it where it sits: after the list, before the heading. That is a
+reading-order choice, not lost text. 3IRS is unchanged at 1.28% (21/1640, 1/1).
+`columns.pdf`'s golden is untouched; the two-column `Region::Columns` path is a
+different split.
+
+Tests: 117 (was 116). The new test uses the measured page-3 positions, the two
+candidate cuts, the 5.87pt row marker, and the row rules; it asserts the cut is
+in 361.05..372.72, the 3x3 table and the header/row cells. It fails on the old
+first-evaluated tie-break, the old minimum-bottom row rule and the merged
+header cell.
+
