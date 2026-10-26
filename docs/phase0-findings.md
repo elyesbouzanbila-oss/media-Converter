@@ -726,3 +726,44 @@ in 361.05..372.72, the 3x3 table and the header/row cells. It fails on the old
 first-evaluated tie-break, the old minimum-bottom row rule and the merged
 header cell.
 
+## Finding D18 - page furniture is not a column
+
+Page 5 of `TP2 Admin BD 2026_2027.pdf` prints its footer at PDF y 42.88 (band
+top 53.88), below the 56.7pt content bottom. The 7.1 Session block sits above
+it: `Session A`/`Session B` at 168.55, the fused `[A1]`/`[B1]` row at 144.55.
+Before this fix the footer band joined the Session A/B cut window, because the
+window's walk accepts a one-sided band while its largest glyph stays within
+1.05x of the window's largest glyph (the footer is 11pt; the header is 11pt and
+the cells 10.5pt). The footer's left
+segment starts at x 42.29 — left of every cell in the block — so it moved the
+left side anchor, and the cut read 7.1 column-major: `Session A`, `[A1]`, then
+the footer's left half, then `Session B`, `[B1]`, then `Page 5 sur 6`.
+
+A footer is not a column. `split_page_furniture` now takes a band out of the
+page before `cut_columns` when the band lies entirely outside the content box:
+`band.top < margin_bottom` is bottom furniture, `band.bottom > height -
+margin_top` is top furniture. The bottom test uses the band's top, not its
+bottom, so a line that merely descends into the bottom margin is still body
+text; the synthetic `a_short_line_ends_the_paragraph` test sits at y 52 with
+top 63 and would otherwise become a footer. Top furniture is emitted before the
+body, bottom furniture after it — reading order, not the content-stream order
+MuPDF reports, which puts the footer first because that is where the producer
+wrote it.
+
+Measured: 7.1 now reads row-major as a 4x2 table with header
+`Session A | Session B`; the footer is one paragraph at the page end
+(`Administration Base de Données L3IRS A.U.2026/2027 Page 5 sur 6`). Only
+page 5's block tree changed. TP2 is **3.56%** (72/2022, similarity 98.02%),
+missing/extra unchanged 3/3; 3IRS is unchanged at 1.28% (21/1640, 1/1). The
+remaining TP2 difference includes MuPDF putting the footer block first, which
+is content-stream order, not reading order.
+
+No DOCX header/footer parts are written and no repeated-text detection is
+attempted: the measured signal is position outside the content box, and a
+running header set inside it would still read as body text.
+
+Tests: 118 (was 117). The new test uses page 5's measured footer and Session
+geometry, asserts 7.1 is a two-column table with the `Session A | Session B`
+header, and asserts the footer is the last paragraph and appears once. It fails
+on the old code with the Session block read as paragraphs.
+

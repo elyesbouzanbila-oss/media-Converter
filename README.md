@@ -4,7 +4,7 @@
   <a href="#licences"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg"></a>
   <img alt="Rust 1.92+" src="https://img.shields.io/badge/rust-1.92%2B-orange.svg?logo=rust&logoColor=white">
   <img alt="Platform: Windows" src="https://img.shields.io/badge/platform-windows-lightgrey.svg?logo=windows&logoColor=white">
-  <img alt="Version: 0.1.0-alpha.4" src="https://img.shields.io/badge/version-0.1.0--alpha.4-orange.svg">
+  <img alt="Version: 0.1.0-alpha.5" src="https://img.shields.io/badge/version-0.1.0--alpha.5-orange.svg">
   <img alt="Status: in development" src="https://img.shields.io/badge/status-in%20development-orange.svg">
 </p>
 
@@ -22,11 +22,11 @@ byte-identical output.
 > [!NOTE]
 > **Ongoing development**
 > The PDF reader, DOCX writer, engine facade, CLI, GUI and packaging step all
-> work, and the workspace's 117 tests pass. Input formats beyond PDF and targets
+> work, and the workspace's 118 tests pass. Input formats beyond PDF and targets
 > beyond DOCX are planned.
 
 > [!NOTE]
-> **Status: in development (`0.1.0-alpha.4`)**
+> **Status: in development (`0.1.0-alpha.5`)**
 > This is early software. Command-line flags, the GUI's settings format and the
 > shape of the Doc IR may change between versions, without a compatibility
 > guarantee.
@@ -213,7 +213,7 @@ exactly where it is told.
 cargo test --profile spike
 ```
 
-The 100 tests cover the Doc IR, the PDF geometry and analyser, the DOCX writer,
+The 118 tests cover the Doc IR, the PDF geometry and analyser, the DOCX writer,
 the facade, the CLI's process pool and the GUI's engine protocol. Three are real
 end-to-end runs over the committed fixtures:
 
@@ -253,7 +253,7 @@ with MuPDF (PyMuPDF), an independent implementation:
 | Document | Pages | Word error | Similarity | Missing | Extra |
 | --- | --- | --- | --- | --- | --- |
 | `3IRS_TP2.pdf` | 5 | **1.28 %** | 99.21 % | 1 | 1 |
-| `TP2 Admin BD 2026_2027.pdf` | 6 | **3.76 %** | 97.92 % | 3 | 3 |
+| `TP2 Admin BD 2026_2027.pdf` | 6 | **3.56 %** | 98.02 % | 3 | 3 |
 
 Missing and extra tokens are the order-independent measure and are the honest
 one; word error rate depends on MuPDF's own block order, which is not guaranteed
@@ -273,6 +273,10 @@ small generated documents that pin bytes end to end.
   on purpose. The page-3 script list beside the account table is now cut at the
   list/table boundary, so the list is read whole before the table and the table
   keeps its marker column.
+- **Page headers and footers are ordinary paragraphs.** A band entirely outside
+  the content box is emitted once at the page's top or bottom, so it cannot
+  break a column cut, but it is not a Word header/footer and repeated text is
+  not detected.
 - **A fully ruled table with exactly two rows.** The rule-based grouping needs
   two internal rules before absence of a rule between bands means "same row"; a
   two-row table has one, so an every-cell-wrapped row can still split. A

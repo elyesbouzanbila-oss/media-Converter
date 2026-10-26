@@ -267,11 +267,19 @@ pub fn build_page(
     profile: &DocumentProfile,
     page: &ir::PageSetup,
 ) -> Vec<Block> {
-    let (bands, windows) = cut_columns(bands);
+    // A footer is page furniture, not part of a column. Page 5 of `TP2 Admin BD
+    // 2026_2027.pdf` has its footer at PDF y 42.88, below the 56.7pt content
+    // bottom; the Session A/B cut window reached it, split the footer's two
+    // segments between the columns, and the left segment's x 42.29 broke the
+    // side anchors so 7.1 read column-major. Keep margin bands out of the cut
+    // and emit them once at the page edge.
+    let (top, body, bottom) = split_page_furniture(bands, page);
+    let (body, windows) = cut_columns(&body);
     let mut blocks = Vec::new();
+    emit_flow(&top, profile, &mut blocks);
     let mut index = 0;
 
-    while index < bands.len() {
+    while index < body.len() {
         // A window the cut pass already decided: row-major windows go to the
         // table builder directly; stream windows are read as two regions, the
         // left strip first, the right after — the reading MuPDF gives the
@@ -279,11 +287,11 @@ pub fn build_page(
         if let Some((_, window)) = windows.iter().find(|(start, _)| *start == index) {
             match (&window.columns, window.cut) {
                 (Some(columns), _) => {
-                    blocks.push(build_table(&bands, index, window.end, columns, rules));
+                    blocks.push(build_table(&body, index, window.end, columns, rules));
                 }
                 (None, Some(cut)) => {
                     let (lefts, rights) =
-                        split_window(&bands[index..window.end], cut);
+                        split_window(&body[index..window.end], cut);
                     emit_region(&lefts, rules, profile, page, &mut blocks);
                     emit_region(&rights, rules, profile, page, &mut blocks);
                 }
@@ -299,13 +307,49 @@ pub fn build_page(
             .map(|(start, _)| *start)
             .filter(|start| *start > index)
             .min()
-            .unwrap_or(bands.len())
+            .unwrap_or(body.len())
             .max(index + 1);
-        emit_region(&bands[index..end], rules, profile, page, &mut blocks);
+        emit_region(&body[index..end], rules, profile, page, &mut blocks);
         index = end;
     }
 
+    emit_flow(&bottom, profile, &mut blocks);
     blocks
+}
+
+/// Split off page furniture: bands that lie entirely outside the content box.
+/// The bottom band is the printed footer (page 5 of
+/// `TP2 Admin BD 2026_2027.pdf` at y 42.88, content bottom 56.7). A band only
+/// half in the margin is not furniture: 3IRS's bare page number at 48.96 has
+/// its top at 60.0, and the synthetic `a_short_line_ends_the_paragraph` line
+/// at y 52 has top 63. A heading at the top of the content box is not
+/// furniture either: page 1's H1 bottom is 738.58 and the content top is 785.1.
+///
+/// The split happens before the cut pass because page furniture is not a
+/// column. Leaving the footer in the 7.1 Session window split its two segments
+/// between the columns and made its left x 42.29 look like a column anchor,
+/// which turned the block column-major.
+fn split_page_furniture(
+    bands: &[Band],
+    page: &ir::PageSetup,
+) -> (Vec<Band>, Vec<Band>, Vec<Band>) {
+    let content_top = (page.height.as_pt() - page.margin_top.as_pt()) as f32;
+    let content_bottom = page.margin_bottom.as_pt() as f32;
+    let mut top = Vec::new();
+    let mut body = Vec::new();
+    let mut bottom = Vec::new();
+
+    for band in bands {
+        if band.top < content_bottom {
+            bottom.push(band.clone());
+        } else if band.bottom > content_top {
+            top.push(band.clone());
+        } else {
+            body.push(band.clone());
+        }
+    }
+
+    (top, body, bottom)
 }
 
 /// Classify and emit one region of bands — the part of a page between
@@ -2588,6 +2632,99 @@ mod tests {
             cells.contains("[B2] Validez la transaction.") && cells.contains("[A2]"),
             "the one-sided continuation rows must feed the table: {cells}"
         );
+    }
+
+    #[test]
+    fn a_page_footer_below_the_columns_is_emitted_once_at_the_end() {
+        // Page 5 of `TP2 Admin BD 2026_2027.pdf`, 7.1: Session A/B at 168.55,
+        // the fused row at 144.55, and the footer at 42.88. The footer band
+        // lies below the 56.7pt content bottom; before the furniture split it
+        // joined the cut window, its left x 42.29 broke the side anchors, and
+        // 7.1 read column-major with the footer between the columns. The
+        // footer's real left run is 42.29..289.64; the helper's 5.5pt advance
+        // makes the same text wider, so the test text is shortened to leave
+        // the cut in the gap before the page number.
+        let mut glyphs = Vec::new();
+        glyphs.extend(line("Session A", 11.0, 168.55, 77.03, true));
+        glyphs.extend(line("Session B", 11.0, 168.55, 302.70, true));
+        glyphs.extend(line(
+            "[A1] Sélectionnez la ligne du compte n°1",
+            10.5,
+            144.55,
+            78.03,
+            false,
+        ));
+        glyphs.extend(line(
+            "[B1] Tentez de verrouiller la même ligne",
+            10.5,
+            144.55,
+            303.70,
+            false,
+        ));
+        glyphs.extend(line(
+            "en la verrouillant sans le relâcher.",
+            10.5,
+            131.86,
+            78.03,
+            false,
+        ));
+        glyphs.extend(line(
+            "en demandant à Oracle de renvoyer",
+            10.5,
+            131.86,
+            303.70,
+            false,
+        ));
+        glyphs.extend(line(
+            "immédiatement une erreur si le verrou",
+            10.5,
+            119.06,
+            303.70,
+            false,
+        ));
+        glyphs.extend(line("n'est pas disponible.", 10.5, 106.23, 303.70, false));
+        glyphs.extend(line(
+            "Administration Base de Données",
+            11.0,
+            42.88,
+            42.29,
+            true,
+        ));
+        glyphs.extend(line("Page 5 sur 6", 11.0, 42.88, 440.95, true));
+
+        let (bands, profile) = document_of(vec![glyphs]);
+        let blocks = build_page(&bands[0], &[], &profile, &page());
+
+        let Some(table) = blocks.iter().find_map(|block| match block {
+            Block::Table(table) => Some(table),
+            _ => None,
+        }) else {
+            panic!("the Session block must read row-major: {blocks:#?}");
+        };
+        assert_eq!(table.column_count(), 2, "{blocks:#?}");
+        let header: Vec<String> = table.rows[0].cells.iter().map(cell_text).collect();
+        assert_eq!(header, vec!["Session A", "Session B"], "{blocks:#?}");
+
+        let Some(Block::Paragraph { content, .. }) = blocks.last() else {
+            panic!("the footer must be the last paragraph: {blocks:#?}");
+        };
+        let text = ir::inlines_to_plain_text(content);
+        assert!(
+            text.contains("Administration Base de Données") && text.contains("Page 5 sur 6"),
+            "the footer must stay one paragraph after the columns: {text:?}"
+        );
+
+        let footer_parts = blocks
+            .iter()
+            .filter(|block| match block {
+                Block::Paragraph { content, .. } => {
+                    let text = ir::inlines_to_plain_text(content);
+                    text.contains("Administration Base de Données") || text.contains("Page 5 sur 6")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(footer_parts, 1, "the footer must not be split: {blocks:#?}");
     }
 
     #[test]

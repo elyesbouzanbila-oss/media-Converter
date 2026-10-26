@@ -433,7 +433,7 @@ python scripts\compare_docx.py "out\<doc>.docx" "tests\fixtures\private\<doc>.pd
 | Document | Pages | Word error | Similarity | Missing | Extra |
 | --- | --- | --- | --- | --- | --- |
 | `3IRS_TP2.pdf` | 5 | **1.28 %** | 99.21 % | 1 | 1 |
-| `TP2 Admin BD 2026_2027.pdf` | 6 | 3.76 % | 97.92 % | 3 | 3 |
+| `TP2 Admin BD 2026_2027.pdf` | 6 | 3.56 % | 98.02 % | 3 | 3 |
 
 **Read the missing/extra columns, not the headline.** Word error rate is
 order-sensitive and its reference is MuPDF's own block order, which is not
@@ -554,7 +554,7 @@ goldens, the GUI with its real engine, packaging, and CI.
 deliberately names no commit hashes, because a hash in a document goes stale
 the moment anyone commits.
 
-**Tests:** 117 — `dconv-ir` 17, `dconv-pdf` 46 (39 geometry, plus the seven
+**Tests:** 118 — `dconv-ir` 17, `dconv-pdf` 47 (40 geometry, plus the seven
 bind tests), `dconv-docx` 12, `dconv-engine` 9 (eight unit, plus the end-to-end
 golden run), `dconv-cli` 9 (seven unit, plus two end-to-end pool runs: pooled
 vs serial vs goldens), `dconv-app` 24 (ten queue/settings, two log, nine
@@ -570,8 +570,9 @@ engine protocol, two palette-contrast, plus the worker-vs-golden run in
    general `Region::Columns` two-column page, whose `columns.pdf` golden still
    pins the across-columns behaviour on purpose. MuPDF's page-3 block order also
    puts the table after the whole page flow, so the order-sensitive WER still
-   counts the table block as moved; the rest of TP2's 76 is the page
-   header/footer segment order and the dropped `U+0002` hyphens.
+   counts the table block as moved; the rest of TP2's 72 is the footer's
+   position (MuPDF's content-stream order puts it first) and the dropped
+   `U+0002` hyphens.
 2. **A fully ruled table with exactly two rows** — the rule-based grouping
    needs two internal rules before absence of a rule between bands means "same
    row", because a table that rules only its header would otherwise merge its
